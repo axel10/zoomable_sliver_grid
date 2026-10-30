@@ -88,11 +88,12 @@ class _ZoomGestureLayerState extends State<ZoomGestureLayer>
     }
   }
 
-  void _startPinchGesture() {
+  void _startPinchGesture({Offset? focal}) {
     _pinchController.startPinch(
       widget.zoomScale,
       min: widget.minScale,
       max: widget.maxScale,
+      focal: focal,
     );
   }
 
@@ -137,14 +138,15 @@ class _ZoomGestureLayerState extends State<ZoomGestureLayer>
 
   static const double _kPinchActivateRatio = 1e-3;
 
-  void _pushPinchScale(double scale) {
+  void _pushPinchScale(double scale, {Offset? focal}) {
     if (_pinchController.isEnding) return;
     if (!_pinchController.isActive) {
       if ((scale - 1.0).abs() < _kPinchActivateRatio) return;
-      _startPinchGesture();
+      _startPinchGesture(focal: focal);
     }
     _pinchController.updatePinch(
       scale: scale,
+      focal: focal,
       onThresholdCrossed: () {
         if (widget.enableHaptics) {
           HapticFeedback.selectionClick();
@@ -154,7 +156,7 @@ class _ZoomGestureLayerState extends State<ZoomGestureLayer>
   }
 
   void _handlePanZoomUpdate(PointerPanZoomUpdateEvent event) {
-    _pushPinchScale(event.scale);
+    _pushPinchScale(event.scale, focal: event.position);
   }
 
   void _handlePanZoomEnd(PointerPanZoomEndEvent event) {
@@ -186,7 +188,17 @@ class _ZoomGestureLayerState extends State<ZoomGestureLayer>
     final span = _currentSpan();
     if (span <= 0) return;
 
-    _pushPinchScale(span / base);
+    _pushPinchScale(span / base, focal: _currentFocal());
+  }
+
+  /// 双指中点（全局坐标），作为捏合缩放时"手指下方内容不动"的焦点。
+  Offset? _currentFocal() {
+    if (_touchPointers.isEmpty) return null;
+    var sum = Offset.zero;
+    for (final point in _touchPointers.values) {
+      sum += point;
+    }
+    return sum / _touchPointers.length.toDouble();
   }
 
   void _handleTouchUp(PointerEvent event) {

@@ -39,6 +39,11 @@ class FolderZoomPinchController extends ChangeNotifier {
   /// 当前捏合比例（以手势开始时的间距为 `1.0`）。
   double get currentScale => _currentScale;
 
+  Offset? _focalGlobal;
+
+  /// 手势焦点（双指中点）的全局坐标，用于把焦点锚固定在手指下方。
+  Offset? get focalGlobal => _focalGlobal;
+
   bool _isCommitted = false;
 
   /// 当前是否已超过换档阈值（松手是否会确认换档）。
@@ -68,6 +73,7 @@ class FolderZoomPinchController extends ChangeNotifier {
     double currentScale, {
     double? min,
     double? max,
+    Offset? focal,
   }) {
     _animController?.stop();
     _animController?.dispose();
@@ -76,6 +82,7 @@ class FolderZoomPinchController extends ChangeNotifier {
     _isActive = true;
     _isEnding = false;
     _committedScale = null;
+    _focalGlobal = focal;
     _baseZoomScale = snapFolderZoomScale(currentScale);
     _targetZoomScale = _baseZoomScale;
     _progress = 0.0;
@@ -91,11 +98,13 @@ class FolderZoomPinchController extends ChangeNotifier {
   /// - 放大：双指距离移动到原本两倍（scale = 2.0）时，放大一档的动画正好完成（progress = 1.0）。
   void updatePinch({
     required double scale,
+    Offset? focal,
     VoidCallback? onThresholdCrossed,
   }) {
     if (!_isActive || _isEnding) return;
     if (scale <= 0 || scale.isNaN) return;
     _currentScale = scale;
+    if (focal != null) _focalGlobal = focal;
 
     final double candidateTarget;
     final double rawProgress;
