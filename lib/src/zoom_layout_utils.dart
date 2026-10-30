@@ -1136,7 +1136,31 @@ class _FolderZoomSliverBuilderState extends State<FolderZoomSliverBuilder>
     return position;
   }
 
+  /// 在渲染树里定位本 sliver 所属的 [ScrollPosition]。
+  ///
+  /// 两种常见用法方向相反，都要覆盖：
+  /// - [FolderZoomSliverBuilder] 被放进 `CustomScrollView.slivers` 里（多数页面如此）：
+  ///   它的 renderObject 就是一个 sliver，viewport 在**祖先**方向；
+  /// - 它包住整个 `CustomScrollView`（README 的写法）：viewport 在**后代**里。
+  ///
+  /// 以前只朝后代遍历，前一种用法恒返回 `null`，滚动补偿静默失效——表现为
+  /// 中段/底部换档时内容原地跳变而不是跟着焦点平移。
   static ScrollPosition? _findViewportPosition(RenderObject? root) {
+    if (root == null) return null;
+
+    if (root is RenderSliver) {
+      RenderObject? node = root.parent;
+      while (node != null) {
+        if (node is RenderViewportBase) {
+          final offset = node.offset;
+          if (offset is ScrollPosition) return offset;
+        }
+        final parent = node.parent;
+        node = parent is RenderObject ? parent : null;
+      }
+      return null;
+    }
+
     ScrollPosition? result;
     void visit(RenderObject node) {
       if (result != null) return;
@@ -1150,7 +1174,7 @@ class _FolderZoomSliverBuilderState extends State<FolderZoomSliverBuilder>
       node.visitChildren(visit);
     }
 
-    if (root != null) visit(root);
+    visit(root);
     return result;
   }
 
