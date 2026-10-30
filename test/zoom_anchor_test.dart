@@ -15,6 +15,7 @@ class Harness extends StatefulWidget {
     required this.initialZoom,
     this.count = 120,
     this.passController = true,
+    this.withGestureLayer = false,
   });
 
   final double initialZoom;
@@ -23,6 +24,9 @@ class Harness extends StatefulWidget {
   /// 是否把 controller 显式传给 [FolderZoomSliverBuilder]；
   /// `false` 时走"自动从渲染树里找 ScrollPosition"的兜底路径。
   final bool passController;
+
+  /// 是否套一层 [ZoomGestureLayer]（真机上的捏合手势入口）。
+  final bool withGestureLayer;
 
   @override
   State<Harness> createState() => HarnessState();
@@ -40,7 +44,7 @@ class HarnessState extends State<Harness> {
       home: Scaffold(
         body: LayoutBuilder(
           builder: (context, c) {
-            return FolderZoomSliverBuilder(
+            final content = FolderZoomSliverBuilder(
               zoomScale: zoom,
               width: c.maxWidth,
               controller: widget.passController ? controller : null,
@@ -75,6 +79,12 @@ class HarnessState extends State<Harness> {
                   ],
                 );
               },
+            );
+            if (!widget.withGestureLayer) return content;
+            return ZoomGestureLayer(
+              zoomScale: zoom,
+              onZoomScaleChanged: setZoom,
+              child: content,
             );
           },
         ),
@@ -119,8 +129,10 @@ Future<HarnessState> _pump(
   WidgetTester tester, {
   required double initialZoom,
   bool passController = true,
+  bool withGestureLayer = false,
+  Size size = const Size(1200, 800),
 }) async {
-  tester.view.physicalSize = const Size(1200, 800);
+  tester.view.physicalSize = size;
   tester.view.devicePixelRatio = 1.0;
   addTearDown(tester.view.reset);
 
@@ -130,6 +142,7 @@ Future<HarnessState> _pump(
       key: key,
       initialZoom: initialZoom,
       passController: passController,
+      withGestureLayer: withGestureLayer,
     ),
   );
   await tester.pumpAndSettle();
@@ -323,6 +336,77 @@ void main() {
     expect(tester.takeException(), isNull);
     expect(controller.offset, isNot(closeTo(before, 0.5)),
         reason: '捏合换档后应按焦点换算滚动位置');
+  });
+
+  /// 回归：挂上 [ZoomGestureLayer] 后，捏合换档必须真的驱动滚动。
+  ///
+  /// 早期 `startPinch()` 自己会 notify 一次，而那时 `updatePinch()` 还没跑过，
+  /// `targetZoomScale` 仍然等于基准档位。`_FolderZoomSliverBuilderState` 就在这一帧
+  /// 把"目标滚动位置"锁死成了起点 —— 整段捏合期间 `pixels` 一动不动，几何层却
+  /// 一路插值到目标档位，条目于是被甩出视口上千像素。真机上的观感就是
+  /// "一换档列表就快速上下移动"（桌面端用 Ctrl+滚轮走的是另一条路径，所以没事）。
+  testWidgets('捏合放大：全程跟手，焦点条目不被甩出视口', (tester) async {
+    final state = await _pump(
+      tester,
+      initialZoom: kFolderZoomTierStandardList,
+      withGestureLayer: true,
+      size: const Size(400, 800),
+    );
+    final controller = state.controller;
+    controller.jumpTo(controller.position.maxScrollExtent / 2);
+    await tester.pumpAndSettle();
+
+    const double focusY = 400.0;
+    final before = _snapshot(tester, controller);
+    final anchorIndex = before.visible.keys.firstWhere(
+      (i) => before.visible[i]! <= focusY && before.visible[i]! + 80 > focusY,
+      orElse: () => before.visible.keys.reduce(
+        (a, b) => (before.visible[a]! - focusY).abs() <=
+                (before.visible[b]! - focusY).abs()
+            ? a
+            : b,
+      ),
+    );
+    final anchorTopBefore = before.visible[anchorIndex]!;
+
+    final g1 = await tester.startGesture(const Offset(150, 300));
+    final g2 = await tester.startGesture(const Offset(250, 400));
+    await tester.pump(const Duration(milliseconds: 16));
+
+    for (var step = 1; step <= 6; step++) {
+      final d = step * 6.0;
+      await g1.moveTo(Offset(150 - d, 300 - d));
+      await g2.moveTo(Offset(250 + d, 400 + d));
+      await tester.pump(const Duration(milliseconds: 16));
+
+      final frame = _snapshot(tester, controller);
+      expect(
+        frame.visible.containsKey(anchorIndex),
+        isTrue,
+        reason: '第 $step 步焦点条目 $anchorIndex 被甩出视口 '
+            '（pixels=${frame.pixels.toStringAsFixed(1)}，'
+            '可见=${frame.visible.keys.toList()}）',
+      );
+      expect(
+        (frame.visible[anchorIndex]! - anchorTopBefore).abs(),
+        lessThan(40.0),
+        reason: '第 $step 步焦点条目位移过大：'
+            'before=$anchorTopBefore now=${frame.visible[anchorIndex]}',
+      );
+    }
+
+    await g1.up();
+    await g2.up();
+    await tester.pumpAndSettle();
+
+    expect(state.zoom, kFolderZoomTierLargeList);
+    final after = _snapshot(tester, controller);
+    expect(after.visible.containsKey(anchorIndex), isTrue);
+    expect(
+      after.pixels,
+      isNot(closeTo(before.pixels, 0.5)),
+      reason: '捏合换档必须补偿滚动，否则内容会整体平移',
+    );
   });
 
   testWidgets('list -> list：焦点处的内容停在原高度', (tester) async {

@@ -123,6 +123,11 @@ Everything else follows from this:
   start → target (no per-tier accumulation).
 - **While pinching** the focus is the two-finger midpoint, so the content under your fingers does not
   slide — that is what makes a pinch feel like a zoom instead of a drag.
+- **Only items visible in both tiers are translated.** Items that are visible in just one of the two
+  layouts are pinned to their own tier's screen position and faded in / out in place
+  (`FolderZoomItemPinning`). The classification is computed **once, when the transition starts**:
+  visibility is a boolean and the scroll position moves thousands of pixels mid-transition, so
+  re-evaluating it every frame would flip items back and forth and make them teleport.
 
 The practical effect: the items visible before a tier change are, as far as the new layout allows,
 still visible after it, and the ones that must fade in/out are the fewest possible.

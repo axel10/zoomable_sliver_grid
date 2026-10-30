@@ -2,6 +2,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'zoom_debug.dart';
 import 'zoom_layout_utils.dart';
 import 'zoom_pinch.dart';
 
@@ -71,6 +72,9 @@ class _ZoomGestureLayerState extends State<ZoomGestureLayer>
     final current = widget.zoomScale;
     final stepped = stepFolderZoomScale(current, steps);
     final next = stepped.clamp(widget.minScale, widget.maxScale);
+    zoomLog('step', () {
+      return 'wheel steps=$steps ${zd(current, 3)} -> ${zd(next, 3)}';
+    });
     if ((next - current).abs() < 1e-6) return;
     widget.onZoomScaleChanged(next);
     if (haptic && widget.enableHaptics) {
@@ -81,6 +85,9 @@ class _ZoomGestureLayerState extends State<ZoomGestureLayer>
   void _commitPinchTier(double newScale) {
     final current = widget.zoomScale;
     final next = newScale.clamp(widget.minScale, widget.maxScale);
+    zoomLog('commit', () {
+      return 'pinch ${zd(current, 3)} -> ${zd(next, 3)}';
+    });
     if ((next - current).abs() < 1e-6) return;
     widget.onZoomScaleChanged(next);
     if (widget.enableHaptics) {
@@ -175,6 +182,10 @@ class _ZoomGestureLayerState extends State<ZoomGestureLayer>
     if (_touchPointers.length >= 2) {
       _pinchBaseSpan = _currentSpan();
     }
+    zoomLog('touch', () {
+      return 'down #${event.pointer} n=${_touchPointers.length} '
+          'span=${zd(_pinchBaseSpan)} at=${event.position}';
+    });
   }
 
   void _handleTouchMove(PointerMoveEvent event) {
@@ -188,8 +199,22 @@ class _ZoomGestureLayerState extends State<ZoomGestureLayer>
     final span = _currentSpan();
     if (span <= 0) return;
 
-    _pushPinchScale(span / base, focal: _currentFocal());
+    final double ratio = span / base;
+    _pushPinchScale(ratio, focal: _currentFocal());
+    // 手指移动事件很密，按比例变化抽稀，避免日志本身拖慢判断。
+    if (_lastLoggedRatio == null || (ratio - _lastLoggedRatio!).abs() > 0.02) {
+      _lastLoggedRatio = ratio;
+      zoomLog('touch', () {
+        return 'move n=${_touchPointers.length} '
+            'span=${zd(span)} base=${zd(base)} ratio=${zd(ratio, 3)} '
+            'active=${_pinchController.isActive} '
+            't=${zd(_pinchController.progress, 3)} '
+            'target=${zd(_pinchController.targetZoomScale, 3)}';
+      });
+    }
   }
+
+  double? _lastLoggedRatio;
 
   /// 双指中点（全局坐标），作为捏合缩放时"手指下方内容不动"的焦点。
   Offset? _currentFocal() {
@@ -204,6 +229,13 @@ class _ZoomGestureLayerState extends State<ZoomGestureLayer>
   void _handleTouchUp(PointerEvent event) {
     if (!_isTouch(event)) return;
     if (_touchPointers.remove(event.pointer) == null) return;
+    zoomLog('touch', () {
+      return 'up #${event.pointer} n=${_touchPointers.length} '
+          'active=${_pinchController.isActive} '
+          'ending=${_pinchController.isEnding} '
+          't=${zd(_pinchController.progress, 3)}';
+    });
+    _lastLoggedRatio = null;
     if (_touchPointers.length < 2) {
       _pinchBaseSpan = null;
       if (_pinchController.isActive && !_pinchController.isEnding) {

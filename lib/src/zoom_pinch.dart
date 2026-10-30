@@ -1,5 +1,6 @@
 import 'dart:ui' show lerpDouble;
 import 'package:flutter/material.dart';
+import 'zoom_debug.dart';
 import 'zoom_layout_utils.dart';
 
 /// 捏合手势控制器：管理「手指捏合条目实时跟随缩放」与「未达阈值回弹 / 超过阈值换档」的交互状态。
@@ -90,6 +91,11 @@ class FolderZoomPinchController extends ChangeNotifier {
     _isCommitted = false;
     if (min != null) minScale = min;
     if (max != null) maxScale = max;
+    zoomLog('pinchCtl', () {
+      return 'start base=${zd(currentScale, 3)} '
+          'snapped=${zd(_baseZoomScale, 3)} '
+          'target=${zd(_targetZoomScale, 3)} focal=$focal';
+    });
     notifyListeners();
   }
 
@@ -141,9 +147,16 @@ class FolderZoomPinchController extends ChangeNotifier {
       return;
     }
 
+    if ((candidateTarget - _targetZoomScale).abs() > 1e-6) {
+      zoomLog('pinchCtl', () {
+        return 'target ${zd(_targetZoomScale, 3)} -> ${zd(candidateTarget, 3)} '
+            'scale=${zd(scale, 3)} progress=${zd(nextProgress, 3)} '
+            'committed=$_isCommitted';
+      });
+    }
+
     _targetZoomScale = candidateTarget;
     _progress = nextProgress;
-
     if (!hasTarget) {
       if (_isCommitted) {
         _isCommitted = false;
@@ -172,6 +185,11 @@ class FolderZoomPinchController extends ChangeNotifier {
   /// 若超过阈值，平滑动画吸附至 `1.0`，完成后调用 [onCommit] 持久化新档位。
   void endPinch({required void Function(double newScale) onCommit}) {
     if (!_isActive || _isEnding) return;
+
+    zoomLog('pinchCtl', () {
+      return 'end progress=${zd(_progress, 3)} committed=$_isCommitted '
+          'target=${zd(_targetZoomScale, 3)} base=${zd(_baseZoomScale, 3)}';
+    });
 
     // 从头到尾没有跟手位移，也没有确认换档（触控板轻扫、双指平移、误触）：
     // 不必跑 200ms 的吸附动画，直接收尾。
@@ -226,6 +244,10 @@ class FolderZoomPinchController extends ChangeNotifier {
         if (shouldCommit) {
           onCommit(targetScale);
         }
+        zoomLog('pinchCtl', () {
+          return 'settled commit=$shouldCommit scale=${zd(targetScale, 3)} '
+              'committedScale=${zd(_committedScale, 3)}';
+        });
         notifyListeners();
       }
     });
