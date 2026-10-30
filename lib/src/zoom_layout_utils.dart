@@ -477,7 +477,11 @@ class FolderZoomGeometryLayer {
       );
 }
 
-/// 单侧可见条目在淡入淡出时的缩放幅度（`0.15` 对应 `0.85 <-> 1.0` 与 `1.0 <-> 1.15`）。
+/// 旧版"单侧可见条目淡入淡出"的缩放幅度。
+///
+/// 过渡期改为纯几何加权后（见 [FolderZoomLayoutMetrics.resolveItemTransition]），
+/// 单侧可见条目不再原地淡入淡出，这个常量已不参与布局。保留仅为兼容性。
+@Deprecated('单侧可见条目不再做淡入淡出，此常量已不再参与布局')
 const double kFolderZoomFadeScaleDelta = 0.15;
 
 /// 焦点默认高度（占视口高度的比例）：`0.5` 即视口中心。
@@ -546,6 +550,20 @@ class FolderZoomViewportTracker {
   /// Sliver 的条目总数，用于换算各档位的最大滚动偏移（由 `computeMaxScrollOffset` 回填）。
   int? contentCount;
 
+  /// 读取当前滚动像素值的回调，由 [FolderZoomSliverBuilder] 注入。
+  ///
+  /// 布局回调里拿不到 [ScrollPosition]，但换档时要把"sliver 坐标"换算成"滚动像素"，
+  /// 需要知道两者之间的固定差值（外层 padding / 前置 sliver 的高度）。这里记下每次
+  /// 布局时刻的像素值，换档时就能把"当前像素"还原成同一时刻的 sliver 顶部。
+  ///
+  /// 少了它，过渡动画进行中再次换档会拿"当前像素"去配"上一帧的视口顶部"，
+  /// 目标偏移被算高一整帧的量（实测触底连点两档会多算 290px，滚动越界后靠
+  /// 回弹模拟慢慢弹回来）。
+  double Function()? scrollPixelsReader;
+
+  /// 最近一次布局时的滚动像素值。
+  double? pixelsAtLayout;
+
   /// 最近一次稳态布局所在的档位层。
   FolderZoomGeometryLayer? steadyLayer;
 
@@ -582,6 +600,7 @@ class FolderZoomViewportTracker {
     this.viewportTop = viewportTop;
     this.viewportBottom = viewportBottom;
     this.remainingPaintExtent = remainingPaintExtent;
+    pixelsAtLayout = scrollPixelsReader?.call() ?? pixelsAtLayout;
     this.listMainAxisSpacing = listMainAxisSpacing;
     this.gridCrossAxisSpacing = gridCrossAxisSpacing;
     this.gridMainAxisSpacing = gridMainAxisSpacing;
@@ -818,6 +837,10 @@ class FolderZoomViewportTracker {
 }
 
 /// 单个条目在档位切换过渡期间的呈现方式。
+///
+/// 目前过渡期所有条目都按"共用条目"处理：[isShared] 恒为 `true`，
+/// [opacity] / [scale] 恒为 `1.0`，位置由各档位几何的加权混合给出。
+/// 保留这三个字段是为了让自定义条目仍然可以按同样方式消费这份描述。
 @immutable
 class FolderZoomItemTransition {
   const FolderZoomItemTransition({
@@ -827,16 +850,16 @@ class FolderZoomItemTransition {
     required this.effectiveMetrics,
   });
 
-  /// 是否在起止两个档位都可见（true 时走位移动画，false 时原地淡入淡出+缩放）。
+  /// 是否走"按权重位移"的混合路径（当前恒为 `true`）。
   final bool isShared;
 
-  /// 条目整体不透明度（[isShared] 为 true 时恒为 `1.0`）。
+  /// 条目整体不透明度（恒为 `1.0`）。
   final double opacity;
 
-  /// 条目整体缩放比例（[isShared] 为 true 时恒为 `1.0`）。
+  /// 条目整体缩放比例（恒为 `1.0`）。
   final double scale;
 
-  /// 条目内部排版使用的度量（单侧可见条目锁定在各自所属档位的稳态度量）。
+  /// 条目内部排版使用的度量。
   final FolderZoomLayoutMetrics effectiveMetrics;
 }
 
@@ -927,86 +950,22 @@ class FolderZoomLayoutMetrics {
     this.focusFraction = kFolderZoomFocusCenter,
   });
 
-  /// 解析指定 [index] 在当前帧的过渡状态（双端可见走位移，单端可见走原地淡入淡出+缩放）。
+  /// 解析指定 [index] 在当前帧的过渡状态。
+  ///
+  /// 过渡期一律按"共用条目"处理：位置由 [geometryLayers] 的加权混合给出（见
+  /// `_SliverAnimatedZoomGridLayout.getGeometryForChildIndex`），条目本身不做
+  /// 原地淡入淡出或缩放。
+  ///
+  /// 早期实现在这里按"条目只在起始/目标某一层可见"分了一支，让这类条目锁在
+  /// 所属档位的屏幕位置上淡入淡出。但可见性是布尔量，而过渡期滚动位置要平移几千
+  /// 像素，条目会反复翻转可见性，每次翻转位置就瞬移一次 —— 表现就是整体
+  /// "从下往上弹一下"。改为纯加权后，进出视口与普通滚动一致，不再需要单侧淡出。
   FolderZoomItemTransition resolveItemTransition(int index) {
-    final layers = resolvedGeometryLayers;
-    final tracker = viewportTracker;
-    if (layers.length <= 1 || tracker == null || !tracker.hasMeasurement) {
-      return FolderZoomItemTransition(
-        isShared: true,
-        opacity: 1.0,
-        scale: 1.0,
-        effectiveMetrics: this,
-      );
-    }
-
-    final usableWidth = tracker.usableWidth;
-    final effOuterWidth = outerWidth > 0.0 ? outerWidth : tracker.outerWidth;
-
-    int visibleCount = 0;
-    double visibleWeight = 0.0;
-    bool visibleInTarget = false;
-
-    for (var i = 0; i < layers.length; i++) {
-      final layer = layers[i];
-      final geom = _SliverAnimatedZoomGridLayout.geometryInLayer(
-        layer: layer,
-        index: index,
-        usableWidth: usableWidth,
-        outerWidth: effOuterWidth,
-        isPortrait: isPortrait,
-      );
-      final layerViewTop = tracker.viewportTopForLayer(
-        layer,
-        isPortrait: isPortrait,
-      );
-      final layerViewBottom = layerViewTop + tracker.viewportHeight;
-      final isVisible = _SliverAnimatedZoomGridLayout.isGeometryVisibleInViewport(
-        geom,
-        layerViewTop,
-        layerViewBottom,
-      );
-      if (isVisible) {
-        visibleCount++;
-        visibleWeight += layer.weight;
-        if (i == layers.length - 1) {
-          visibleInTarget = true;
-        }
-      }
-    }
-
-    if (visibleCount == layers.length) {
-      return FolderZoomItemTransition(
-        isShared: true,
-        opacity: 1.0,
-        scale: 1.0,
-        effectiveMetrics: this,
-      );
-    }
-
-    if (visibleCount == 0) {
-      return FolderZoomItemTransition(
-        isShared: false,
-        opacity: 0.0,
-        scale: 1.0,
-        effectiveMetrics: targetEndpointMetrics ?? this,
-      );
-    }
-
-    final double opacity = visibleWeight.clamp(0.0, 1.0);
-    final bool isGrowing = zoomScaleDelta >= 0.0;
-    final double direction = (isGrowing == visibleInTarget) ? -1.0 : 1.0;
-    final double scale =
-        1.0 + direction * kFolderZoomFadeScaleDelta * (1.0 - opacity);
-    final effective = visibleInTarget
-        ? (targetEndpointMetrics ?? this)
-        : (startEndpointMetrics ?? this);
-
     return FolderZoomItemTransition(
-      isShared: false,
-      opacity: opacity,
-      scale: scale,
-      effectiveMetrics: effective,
+      isShared: true,
+      opacity: 1.0,
+      scale: 1.0,
+      effectiveMetrics: this,
     );
   }
 
@@ -1195,13 +1154,23 @@ class _FolderZoomSliverBuilderState extends State<FolderZoomSliverBuilder>
     return result;
   }
 
+  /// 当前滚动像素值；布局期由 [FolderZoomViewportTracker] 回填，用于把
+  /// "sliver 坐标"和"滚动像素"对齐到同一时刻。
+  double _currentScrollPixels() {
+    final position = _scrollPosition();
+    return (position != null && position.hasPixels) ? position.pixels : 0.0;
+  }
+
   @override
   void initState() {
     super.initState();
+    _viewportTracker.scrollPixelsReader = _currentScrollPixels;
     _controller = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 260),
-    )..addListener(_onTick);
+    )
+      ..addListener(_onTick)
+      ..addStatusListener(_onAnimationStatusChanged);
     _curved = CurvedAnimation(
       parent: _controller,
       curve: Curves.easeOutCubic,
@@ -1209,25 +1178,42 @@ class _FolderZoomSliverBuilderState extends State<FolderZoomSliverBuilder>
   }
 
   void _onTick() {
-    if (mounted) {
-      if (_controller.isAnimating &&
-          (_startScrollPixels - _targetScrollPixels).abs() > 0.5) {
-        final position = _scrollPosition();
-        if (position != null &&
-            position.hasPixels &&
-            _viewportTracker.isActiveInViewport) {
-          final target = lerpDouble(
-            _startScrollPixels,
-            _targetScrollPixels,
-            _curved.value,
-          )!;
-          final clamped = target.clamp(0.0, position.maxScrollExtent);
-          if ((position.pixels - clamped).abs() > 0.5) {
-            position.jumpTo(clamped);
-          }
-        }
-      }
-      setState(() {});
+    if (!mounted) return;
+    if (_controller.isAnimating) {
+      _syncScrollToProgress(_curved.value);
+    }
+    setState(() {});
+  }
+
+  /// 过渡结束的那一帧必须补上，否则滚动位置永远差最后一段距离。
+  ///
+  /// `AnimationController` 在最后一个 tick 里会先 `stop()` 再 `notifyListeners()`，
+  /// 于是 `_onTick` 里 `isAnimating` 已经是 false，最后一步会被丢掉（实测触底换档
+  /// 会停在离底部十几像素处，且残差随帧率变化）。所以终帧单独挂在状态监听上。
+  void _onAnimationStatusChanged(AnimationStatus status) {
+    if (status != AnimationStatus.completed || !mounted) return;
+    _syncScrollToProgress(1.0);
+  }
+
+  /// 把滚动位置推到 [progress] 对应的插值位置。
+  void _syncScrollToProgress(double progress) {
+    if ((_startScrollPixels - _targetScrollPixels).abs() <= 0.5) return;
+    final position = _scrollPosition();
+    if (position == null ||
+        !position.hasPixels ||
+        !_viewportTracker.isActiveInViewport) {
+      return;
+    }
+    final target =
+        lerpDouble(_startScrollPixels, _targetScrollPixels, progress)!;
+    // 不按 `position.maxScrollExtent` 夹取：过渡期的最大偏移每帧都在变，
+    // 而这里拿到的是上一帧布局算出来的值。内容正在变长时（触底换档最常见），
+    // 用它夹取会让滚动永远慢一帧 —— 条目被画低上千像素，下一帧再被拽回来，
+    // 屏幕上就是"所有条目从下往上弹一下"。越界交给本次布局的
+    // `applyContentDimensions` 用当前帧的最大偏移纠正。
+    final clamped = math.max(0.0, target);
+    if ((position.pixels - clamped).abs() > 0.5) {
+      position.jumpTo(clamped);
     }
   }
 
@@ -1263,7 +1249,7 @@ class _FolderZoomSliverBuilderState extends State<FolderZoomSliverBuilder>
         isPortrait: isPortrait,
       );
       _pinchBasePixels = position.pixels;
-      _pinchBaseSliverOffset = _viewportTracker.viewportTop;
+      _pinchBaseSliverOffset = _sliverTopForPixels(position.pixels);
       _pinchTargetPixels = (_pinchBasePixels +
               (targetTop - _pinchBaseSliverOffset))
           .clamp(0.0, position.maxScrollExtent);
@@ -1277,6 +1263,19 @@ class _FolderZoomSliverBuilderState extends State<FolderZoomSliverBuilder>
     if ((position.pixels - targetPixels).abs() > 0.5) {
       position.jumpTo(targetPixels);
     }
+  }
+
+  /// 当前像素对应的 sliver 顶部偏移。
+  ///
+  /// [FolderZoomViewportTracker.viewportTop] 是**上一次布局**记下的 sliver 顶部，
+  /// 而换档发生在两帧之间，此时滚动像素可能已经前进了一整帧。直接拿两者相减会
+  /// 把目标偏移算高一个帧的滚动量（实测触底连点两档多算 290px，滚动越界后再靠
+  /// 回弹模拟弹回来）。这里改用"上次布局时的像素 → sliver 顶部"的固定差值换算，
+  /// 保证起点的像素与 sliver 坐标取在同一时刻。
+  double _sliverTopForPixels(double pixels) {
+    final double? layoutPixels = _viewportTracker.pixelsAtLayout;
+    if (layoutPixels == null) return _viewportTracker.viewportTop;
+    return pixels + (_viewportTracker.viewportTop - layoutPixels);
   }
 
   /// 把手势焦点的全局坐标换算成视口内的高度比例。
@@ -1543,20 +1542,20 @@ class _FolderZoomSliverBuilderState extends State<FolderZoomSliverBuilder>
         targetLayer,
         isPortrait: isPortrait,
       );
-      // 起点始终用**真实**视口顶部：过渡中再次换档时，误差不会被累加。
-      final double currentSliverOffset = _viewportTracker.viewportTop;
-      _startSliverOffset = currentSliverOffset;
-      _targetSliverOffset = targetSliverOffset;
 
       final position = _scrollPosition();
       if (position != null &&
           position.hasPixels &&
           _viewportTracker.isActiveInViewport) {
         final currentPixels = position.pixels;
+        _startSliverOffset = _sliverTopForPixels(currentPixels);
+        _targetSliverOffset = targetSliverOffset;
         _startScrollPixels = currentPixels;
         _targetScrollPixels =
             currentPixels + (_targetSliverOffset - _startSliverOffset);
       } else {
+        _startSliverOffset = _viewportTracker.viewportTop;
+        _targetSliverOffset = targetSliverOffset;
         _startScrollPixels = 0.0;
         _targetScrollPixels = 0.0;
       }
@@ -1906,16 +1905,6 @@ class _SliverAnimatedZoomGridLayout extends SliverGridLayout {
     return math.max(0.0, viewportBottom - viewportTop);
   }
 
-  static bool isGeometryVisibleInViewport(
-    SliverGridGeometry geometry,
-    double viewportTop,
-    double viewportBottom,
-  ) {
-    if (viewportBottom <= viewportTop + 0.5) return false;
-    return geometry.trailingScrollOffset > viewportTop + 0.5 &&
-        geometry.scrollOffset < viewportBottom - 0.5;
-  }
-
   static ({double contentWidth, double originOffsetX}) _resolveLayerHorizontal(
     FolderZoomGeometryLayer layer, {
     required double usableWidth,
@@ -2000,67 +1989,43 @@ class _SliverAnimatedZoomGridLayout extends SliverGridLayout {
     if (_hasSingleLayer) {
       return _geometryIn(layers.first, index);
     }
-    SliverGridGeometry? firstVisibleGeometry;
-    SliverGridGeometry? lastVisibleGeometry;
-    bool visibleInTarget = false;
-    int visibleCount = 0;
-    double visibleWeight = 0.0;
-    double scrollOffset = 0.0;
+
+    // 过渡期：条目位置 = 各档位下该条目的**屏幕位置**的加权平均。
+    //
+    // 这里刻意不对"该条目在某一层视口内是否可见"做分支。可见性是布尔量，而过渡期间
+    // 滚动位置要在几千像素上平移，条目会反复翻转可见性；每翻转一次，位置就在
+    // "混合值"与"某一层的锁定值"之间瞬移一次 —— 屏幕上表现为所有条目一起
+    // 从下往上弹一下。改成纯加权之后，位置对 progress 连续，翻转不再产生跳变。
+    //
+    // 用「屏幕位置」而不是原始 `scrollOffset` 做平均：各层的视口顶部由焦点锚
+    // （含过渡期残差修正）给出，这样换算出的位置在屏幕上是稳定的，不受
+    // 过渡期实际滚动量抖动的影响。
+    double weight = 0.0;
+    double screenTop = 0.0;
     double crossAxisOffset = 0.0;
     double mainAxisExtent = 0.0;
     double crossAxisExtent = 0.0;
-    for (var i = 0; i < layers.length; i++) {
-      final layer = layers[i];
+    for (final layer in layers) {
+      final double layerWeight = layer.weight;
+      if (layerWeight <= 0.0) continue;
       final geometry = _geometryIn(layer, index);
-      final layerViewTop = _layerViewportTop(layer);
-      final layerViewBottom = layerViewTop + _viewportHeight;
-      if (isGeometryVisibleInViewport(geometry, layerViewTop, layerViewBottom)) {
-        visibleCount++;
-        firstVisibleGeometry ??= geometry;
-        lastVisibleGeometry = geometry;
-        if (i == layers.length - 1) {
-          visibleInTarget = true;
-        }
-        visibleWeight += layer.weight;
-        scrollOffset += geometry.scrollOffset * layer.weight;
-        crossAxisOffset += geometry.crossAxisOffset * layer.weight;
-        mainAxisExtent += geometry.mainAxisExtent * layer.weight;
-        crossAxisExtent += geometry.crossAxisExtent * layer.weight;
-      }
+      weight += layerWeight;
+      screenTop +=
+          (geometry.scrollOffset - _layerViewportTop(layer)) * layerWeight;
+      crossAxisOffset += geometry.crossAxisOffset * layerWeight;
+      mainAxisExtent += geometry.mainAxisExtent * layerWeight;
+      crossAxisExtent += geometry.crossAxisExtent * layerWeight;
     }
-    if (visibleCount == layers.length && visibleWeight > 1e-6) {
-      final inv = 1.0 / visibleWeight;
-      return SliverGridGeometry(
-        scrollOffset: scrollOffset * inv,
-        crossAxisOffset: crossAxisOffset * inv,
-        mainAxisExtent: mainAxisExtent * inv,
-        crossAxisExtent: crossAxisExtent * inv,
-      );
+    if (weight <= 1e-6) {
+      return _geometryIn(layers.last, index);
     }
-    if (visibleCount > 0) {
-      if (visibleInTarget) {
-        final lastGeom = lastVisibleGeometry!;
-        final targetViewTop = _layerViewportTop(layers.last);
-        final delta = viewportTop - targetViewTop;
-        return SliverGridGeometry(
-          scrollOffset: lastGeom.scrollOffset + delta,
-          crossAxisOffset: lastGeom.crossAxisOffset,
-          mainAxisExtent: lastGeom.mainAxisExtent,
-          crossAxisExtent: lastGeom.crossAxisExtent,
-        );
-      } else {
-        final firstGeom = firstVisibleGeometry!;
-        final startViewTop = _layerViewportTop(layers.first);
-        final delta = viewportTop - startViewTop;
-        return SliverGridGeometry(
-          scrollOffset: firstGeom.scrollOffset + delta,
-          crossAxisOffset: firstGeom.crossAxisOffset,
-          mainAxisExtent: firstGeom.mainAxisExtent,
-          crossAxisExtent: firstGeom.crossAxisExtent,
-        );
-      }
-    }
-    return _geometryIn(layers.last, index);
+    final double inverse = 1.0 / weight;
+    return SliverGridGeometry(
+      scrollOffset: viewportTop + screenTop * inverse,
+      crossAxisOffset: crossAxisOffset * inverse,
+      mainAxisExtent: mainAxisExtent * inverse,
+      crossAxisExtent: crossAxisExtent * inverse,
+    );
   }
 
   static double mainStrideFor({
