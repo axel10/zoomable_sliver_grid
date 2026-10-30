@@ -208,6 +208,13 @@ packages:
       url: "https://pub.flutter-io.cn"
     source: hosted
     version: "15.4.0"
+  zoomable_sliver_grid:
+    dependency: "direct main"
+    description:
+      path: ".."
+      relative: true
+    source: path
+    version: "0.0.1"
 sdks:
   dart: ">=3.12.2 <4.0.0"
   flutter: ">=3.18.0-18.0.pre.54"

@@ -1,121 +1,237 @@
 import 'package:flutter/material.dart';
+import 'package:zoomable_sliver_grid/zoomable_sliver_grid.dart';
 
 void main() {
-  runApp(const MyApp());
+  runApp(const ZoomableGridExampleApp());
 }
 
-class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+class DemoItem {
+  final int id;
+  final String title;
+  final String subtitle;
+  final String info;
+  final Color color;
+  final IconData icon;
 
-  // This widget is the root of your application.
+  const DemoItem({
+    required this.id,
+    required this.title,
+    required this.subtitle,
+    required this.info,
+    required this.color,
+    required this.icon,
+  });
+}
+
+class ZoomableGridExampleApp extends StatelessWidget {
+  const ZoomableGridExampleApp({super.key});
+
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Flutter Demo',
+      title: 'Zoomable Sliver Grid Demo',
+      debugShowCheckedModeBanner: false,
       theme: ThemeData(
-        // This is the theme of your application.
-        //
-        // TRY THIS: Try running your application with "flutter run". You'll see
-        // the application has a purple toolbar. Then, without quitting the app,
-        // try changing the seedColor in the colorScheme below to Colors.green
-        // and then invoke "hot reload" (save your changes or press the "hot
-        // reload" button in a Flutter-supported IDE, or press "r" if you used
-        // the command line to start the app).
-        //
-        // Notice that the counter didn't reset back to zero; the application
-        // state is not lost during the reload. To reset the state, use hot
-        // restart instead.
-        //
-        // This works for code too, not just values: Most code changes can be
-        // tested with just a hot reload.
-        colorScheme: .fromSeed(seedColor: Colors.deepPurple),
+        useMaterial3: true,
+        brightness: Brightness.dark,
+        colorSchemeSeed: Colors.indigoAccent,
       ),
-      home: const MyHomePage(title: 'Flutter Demo Home Page'),
+      home: const DemoHomePage(),
     );
   }
 }
 
-class MyHomePage extends StatefulWidget {
-  const MyHomePage({super.key, required this.title});
-
-  // This widget is the home page of your application. It is stateful, meaning
-  // that it has a State object (defined below) that contains fields that affect
-  // how it looks.
-
-  // This class is the configuration for the state. It holds the values (in this
-  // case the title) provided by the parent (in this case the App widget) and
-  // used by the build method of the State. Fields in a Widget subclass are
-  // always marked "final".
-
-  final String title;
+class DemoHomePage extends StatefulWidget {
+  const DemoHomePage({super.key});
 
   @override
-  State<MyHomePage> createState() => _MyHomePageState();
+  State<DemoHomePage> createState() => _DemoHomePageState();
 }
 
-class _MyHomePageState extends State<MyHomePage> {
-  int _counter = 0;
+class _DemoHomePageState extends State<DemoHomePage> {
+  double _zoomScale = kFolderZoomTierStandardList;
+  final Set<int> _selectedIds = <int>{};
+  bool _isSelectionMode = false;
 
-  void _incrementCounter() {
+  late final List<DemoItem> _items = List.generate(120, (index) {
+    final colors = [
+      Colors.pinkAccent,
+      Colors.deepPurpleAccent,
+      Colors.indigoAccent,
+      Colors.blueAccent,
+      Colors.teal,
+      Colors.green,
+      Colors.amber,
+      Colors.orangeAccent,
+      Colors.deepOrange,
+      Colors.cyan,
+    ];
+    final icons = [
+      Icons.music_note_rounded,
+      Icons.album_rounded,
+      Icons.audiotrack_rounded,
+      Icons.graphic_eq_rounded,
+      Icons.mic_external_on_rounded,
+      Icons.radio_rounded,
+      Icons.headset_rounded,
+      Icons.queue_music_rounded,
+    ];
+    return DemoItem(
+      id: index,
+      title: 'Track ${index + 1} - Acoustic Echo',
+      subtitle: 'Artist ${(index % 12) + 1} • Studio Album ${(index % 5) + 1}',
+      info: '${(3 + (index % 4))}:${((index * 13) % 60).toString().padLeft(2, '0')} | FLAC 24-bit',
+      color: colors[index % colors.length],
+      icon: icons[index % icons.length],
+    );
+  });
+
+  void _toggleSelection(int id) {
     setState(() {
-      // This call to setState tells the Flutter framework that something has
-      // changed in this State, which causes it to rerun the build method below
-      // so that the display can reflect the updated values. If we changed
-      // _counter without calling setState(), then the build method would not be
-      // called again, and so nothing would appear to happen.
-      _counter++;
+      if (_selectedIds.contains(id)) {
+        _selectedIds.remove(id);
+        if (_selectedIds.isEmpty) _isSelectionMode = false;
+      } else {
+        _selectedIds.add(id);
+        _isSelectionMode = true;
+      }
     });
   }
 
   @override
   Widget build(BuildContext context) {
-    // This method is rerun every time setState is called, for instance as done
-    // by the _incrementCounter method above.
-    //
-    // The Flutter framework has been optimized to make rerunning build methods
-    // fast, so that you can just rebuild anything that needs updating rather
-    // than having to individually change instances of widgets.
     return Scaffold(
       appBar: AppBar(
-        // TRY THIS: Try changing the color here to a specific color (to
-        // Colors.amber, perhaps?) and trigger a hot reload to see the AppBar
-        // change color while the other colors stay the same.
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        // Here we take the value from the MyHomePage object that was created by
-        // the App.build method, and use it to set our appbar title.
-        title: Text(widget.title),
-      ),
-      body: Center(
-        // Center is a layout widget. It takes a single child and positions it
-        // in the middle of the parent.
-        child: Column(
-          // Column is also a layout widget. It takes a list of children and
-          // arranges them vertically. By default, it sizes itself to fit its
-          // children horizontally, and tries to be as tall as its parent.
-          //
-          // Column has various properties to control how it sizes itself and
-          // how it positions its children. Here we use mainAxisAlignment to
-          // center the children vertically; the main axis here is the vertical
-          // axis because Columns are vertical (the cross axis would be
-          // horizontal).
-          //
-          // TRY THIS: Invoke "debug painting" (choose the "Toggle Debug Paint"
-          // action in the IDE, or press "p" in the console), to see the
-          // wireframe for each widget.
-          mainAxisAlignment: .center,
-          children: [
-            const Text('You have pushed the button this many times:'),
-            Text(
-              '$_counter',
-              style: Theme.of(context).textTheme.headlineMedium,
+        title: const Text('Zoomable Sliver Grid'),
+        actions: [
+          if (_isSelectionMode)
+            IconButton(
+              icon: const Icon(Icons.close_rounded),
+              tooltip: 'Clear Selection',
+              onPressed: () {
+                setState(() {
+                  _selectedIds.clear();
+                  _isSelectionMode = false;
+                });
+              },
             ),
-          ],
-        ),
+          ZoomButton(
+            zoomScale: _zoomScale,
+            onZoomScaleChanged: (scale) {
+              setState(() => _zoomScale = scale);
+            },
+          ),
+          const SizedBox(width: 8),
+        ],
       ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _incrementCounter,
-        tooltip: 'Increment',
-        child: const Icon(Icons.add),
+      body: LayoutBuilder(
+        builder: (context, constraints) {
+          return ZoomGestureLayer(
+            zoomScale: _zoomScale,
+            onZoomScaleChanged: (scale) {
+              setState(() => _zoomScale = scale);
+            },
+            child: FolderZoomSliverBuilder(
+              zoomScale: _zoomScale,
+              width: constraints.maxWidth,
+              builder: (context, metrics) {
+                return CustomScrollView(
+                  slivers: [
+                    SliverPadding(
+                      padding: EdgeInsets.symmetric(
+                        horizontal: folderContentHorizontalPadding(
+                          isPortrait: metrics.isPortrait,
+                          gridMorph: metrics.gridMorph,
+                        ),
+                        vertical: 16.0,
+                      ),
+                      sliver: SliverGrid(
+                        gridDelegate: SliverAnimatedZoomGridDelegate(
+                          metrics: metrics,
+                        ),
+                        delegate: SliverChildBuilderDelegate(
+                          (context, index) {
+                            final item = _items[index];
+                            final isSelected = _selectedIds.contains(item.id);
+
+                            return ZoomItemScaffold(
+                              metrics: metrics,
+                              isSelected: isSelected,
+                              isSelectionMode: _isSelectionMode,
+                              onTap: () {
+                                if (_isSelectionMode) {
+                                  _toggleSelection(item.id);
+                                } else {
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    SnackBar(
+                                      content: Text('Tapped ${item.title}'),
+                                      duration: const Duration(milliseconds: 600),
+                                    ),
+                                  );
+                                }
+                              },
+                              onLongPress: () {
+                                _toggleSelection(item.id);
+                              },
+                              cover: ZoomItemCover(
+                                metrics: metrics,
+                                isSelected: isSelected,
+                                isSelectionMode: _isSelectionMode,
+                                onToggleSelect: () => _toggleSelection(item.id),
+                                onPlay: () {
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    SnackBar(
+                                      content: Text('Playing ${item.title}'),
+                                      duration: const Duration(milliseconds: 600),
+                                    ),
+                                  );
+                                },
+                                child: Container(
+                                  decoration: BoxDecoration(
+                                    gradient: LinearGradient(
+                                      begin: Alignment.topLeft,
+                                      end: Alignment.bottomRight,
+                                      colors: [
+                                        item.color.withValues(alpha: 0.85),
+                                        item.color.withValues(alpha: 0.40),
+                                      ],
+                                    ),
+                                  ),
+                                  child: Center(
+                                    child: Icon(
+                                      item.icon,
+                                      color: Colors.white,
+                                      size: 32,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                              titleText: item.title,
+                              subtitleText: item.subtitle,
+                              infoText: item.info,
+                              trailing: IconButton(
+                                icon: const Icon(Icons.more_vert_rounded, size: 20),
+                                onPressed: () {
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    SnackBar(
+                                      content: Text('More for ${item.title}'),
+                                      duration: const Duration(milliseconds: 600),
+                                    ),
+                                  );
+                                },
+                              ),
+                            );
+                          },
+                          childCount: _items.length,
+                        ),
+                      ),
+                    ),
+                  ],
+                );
+              },
+            ),
+          );
+        },
       ),
     );
   }
