@@ -1,3 +1,24 @@
+## 0.0.4
+
+* **适配"缩放列表上方还有别的组件"**：调用方在列表上方放了 header / banner / `SliverAppBar`
+  时，列表起始边不在视口顶端，此时 `SliverConstraints.scrollOffset` 会被 Flutter 钳在 0
+  （`RenderViewportBase.layoutChildSequence`：`scrollOffset <= 0 ? 0 : scrollOffset`）。
+  早期实现直接拿它当 `viewportTop`，于是把这种状态误判成"列表已贴顶"：
+  换档 / 捏合**完全不补偿滚动**（日志里的 `skip: no scroll delta`），内容只在原地往下长，
+  焦点条目被甩出屏外。
+  现在按 `viewportTop = scrollOffset - max(0, viewportMainAxisExtent - remainingPaintExtent)`
+  还原真实坐标系（起始边在视口顶端之下时是负值），改动连带：
+  * `viewportHeight` 恢复成**视口高度**，不再是 `remainingPaintExtent`（被 header 吃掉一截，
+    实测 584 vs 800）；`maxScrollOffsetFor` 与 `_isOnScreen` 的可见性判定随之对齐。
+  * 贴顶判据改成"页面还有没有向上余量"（`pixels == 0`），而不是 `viewportTop <= 0.5`；
+    顶对齐的目标改成"把起始边钉在当前位置"，不再写死 `0`（那会让贴顶换档多滚一整个 header）。
+  * `_resolveFocusY` 的"距顶一屏压焦点"只在**内容起始边已被推到视口顶端之上**时生效；
+    起始边在视口顶端之下时焦点正常取视口中心，交给"焦点落到内容之外才退化成顶对齐"兜底。
+  * `viewportTopForLayer` 的夹取下界从 `0` 改成 `-precede`（页面滚到 0 时的坐标）。
+* **测试**：新增 `test/zoom_header_offset_test.dart`，覆盖"可滚走 header / 吸顶 header"两种布局
+  × 页面顶端 / 中段 / 贴底 × 点击换档 / 双指捏合，断言换档必须补偿滚动、焦点内容留在焦点处、
+  贴底精确贴住 `maxScrollExtent`。已验证这些用例在修复前失败（pixels 原地不动）。
+
 ## 0.0.3
 
 * **修复触底换档"从下往上弹一下"**：过渡期的条目几何曾按"该条目在某一层视口内是否可见"

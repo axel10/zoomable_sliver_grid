@@ -137,6 +137,45 @@ class _DemoHomePageState extends State<DemoHomePage> {
               builder: (context, metrics) {
                 return CustomScrollView(
                   slivers: [
+                    // 演示"缩放列表上方还有别的组件"：列表起始边不在视口顶端时，
+                    // 换档 / 捏合仍要按焦点补偿滚动（见 README「Grid below other slivers」）。
+                    SliverToBoxAdapter(
+                      child: Padding(
+                        padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
+                        child: Container(
+                          height: 160,
+                          decoration: BoxDecoration(
+                            borderRadius: BorderRadius.circular(20),
+                            gradient: const LinearGradient(
+                              begin: Alignment.topLeft,
+                              end: Alignment.bottomRight,
+                              colors: [Color(0xFF3F51B5), Color(0xFF7C4DFF)],
+                            ),
+                          ),
+                          padding: const EdgeInsets.all(20),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            mainAxisAlignment: MainAxisAlignment.end,
+                            children: [
+                              const Icon(Icons.graphic_eq_rounded, size: 32),
+                              const SizedBox(height: 12),
+                              Text(
+                                'Recently played',
+                                style: Theme.of(context)
+                                    .textTheme
+                                    .headlineSmall
+                                    ?.copyWith(fontWeight: FontWeight.w600),
+                              ),
+                              Text(
+                                '上方这块 header 会随列表一起滚走；'
+                                '它还在屏幕内时换档也应该跟手',
+                                style: Theme.of(context).textTheme.bodySmall,
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
                     SliverPadding(
                       padding: EdgeInsets.symmetric(
                         horizontal: folderContentHorizontalPadding(

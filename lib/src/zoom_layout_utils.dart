@@ -518,7 +518,11 @@ class FolderZoomViewportTracker {
   double usableWidth = 0.0;
   double outerWidth = 0.0;
 
-  /// **真实**的 Sliver 滚动偏移，每次布局都会刷新（不再冻结）。
+  /// 视口顶端在 **sliver 坐标系**里的位置，每次布局都会刷新（不再冻结）。
+  ///
+  /// 等于 `pixels - precede`：列表上方还有 header / `SliverPadding` 时它是**负数**
+  /// （起始边还在视口顶端之下）。不要用 `constraints.scrollOffset` 代替 ——
+  /// 那个值被 Flutter 钳在 0，会把"列表起始边在视口下方"错当成"列表已贴顶"。
   double viewportTop = 0.0;
   double viewportBottom = 0.0;
   double remainingPaintExtent = 0.0;
@@ -581,6 +585,29 @@ class FolderZoomViewportTracker {
   /// 视口高度。
   double get viewportHeight => math.max(0.0, viewportBottom - viewportTop);
 
+  /// 该 sliver 之前的滚动内容长度（`pixels - viewportTop`，含外层 `SliverPadding`）。
+  ///
+  /// 稳态下是常量；它把"滚动像素"和"sliver 坐标"联系起来：
+  /// `viewportTop = pixels - precede`。页面滚到最顶端时 `viewportTop == -precede`。
+  double precede = 0.0;
+
+  /// 视口顶端在 sliver 坐标里的最小值（= 页面 `pixels == 0` 时的取值）。
+  ///
+  /// 列表上方还有 header 时它是**负的**：`viewportTop` 落在 `[minViewportTop, ...]`
+  /// 区间里都是合法的，夹取时不能按 0 截断，否则贴顶换档会把列表硬拽到页面最顶端。
+  double get minViewportTop => -precede;
+
+  /// 页面是否已经滚到最顶端。
+  ///
+  /// 只有这时才真的没有"向上滚"的余量，锚定才该退化成顶对齐。用
+  /// `viewportTop <= 0.5` 判断是错的：列表起始边贴在视口顶端之下时它也是 0 或负数，
+  /// 但那恰恰是应该正常补偿滚动的场景。
+  bool get atScrollStart {
+    final double? px = pixelsAtLayout;
+    if (px != null) return px <= 0.5;
+    return viewportTop <= 0.5;
+  }
+
   /// 当前 Sliver 是否在视口中可见（用于多 Sliver 时仅激活可见 Sliver 的滚动吸附）。
   bool get isActiveInViewport => hasMeasurement && remainingPaintExtent > 10.0;
 
@@ -611,13 +638,14 @@ class FolderZoomViewportTracker {
     this.remainingPaintExtent = remainingPaintExtent;
     pixelsAtLayout = scrollPixelsReader?.call() ?? pixelsAtLayout;
 
-    // 不变量：`constraints.scrollOffset` 与 `position.pixels` 之间只差一个**常量**
-    // —— 该 sliver 之前的滚动内容长度（这里是 SliverPadding 的 16px）。
+    // 不变量：`viewportTop` 与 `position.pixels` 之间只差一个**常量**
+    // —— 该 sliver 之前的滚动内容长度（`SliverPadding` 的 16px、上方的 header 高度…）。
     // 这个差值一旦变化，说明拿到的 ScrollPosition 根本不是布局本 sliver 的那个，
     // 后面所有"sliver 坐标 → 滚动像素"的换算都会崩（换档时会看到列表大幅上下移动）。
     final double? px = pixelsAtLayout;
     if (px != null) {
-      final double precede = px - viewportTop;
+      final double precede = math.max(0.0, px - viewportTop);
+      this.precede = precede;
       if (_lastPrecede == null || (precede - _lastPrecede!).abs() > 1.0) {
         zoomLog('align', () {
           return 'top=${zd(viewportTop)} px=${zd(px)} '
@@ -720,7 +748,11 @@ class FolderZoomViewportTracker {
 
     // 贴住两端时直接记成"顶 / 底对齐"，换算精确到像素，且不会因为
     // 焦点落在最后一条的槽位里而少滚一行。
-    if (viewportTop <= 0.5) {
+    //
+    // 顶端的判据是"页面已经滚到最顶端"（再没有向上滚的余量），而不是
+    // `viewportTop <= 0.5`：列表上方还有 header / padding 时，起始边贴在视口顶端
+    // **之下**也会让 `viewportTop` 等于 0 或负数，那种情况恰恰要正常按焦点补偿滚动。
+    if (atScrollStart) {
       _anchorEdge = _ZoomAnchorEdge.top;
       anchorIndex = 0;
       anchorRatio = 0.0;
@@ -738,12 +770,16 @@ class FolderZoomViewportTracker {
 
     _anchorEdge = _ZoomAnchorEdge.none;
 
-    final double focus = _resolveFocusY(
+    double focus = _resolveFocusY(
       height,
       focusFraction,
       layer: layer,
       isPortrait: isPortrait,
     );
+    // 列表起始边还在视口顶端之下（上方有 header、页面刚打开）时，焦点**上方没有
+    // 内容**：把焦点压到第一条上，解出来的目标就等于"把起始边钉在原地"，
+    // 不会把页面莫名往下滚一屏。
+    focus = math.max(focus, -viewportTop);
     final double contentPoint = viewportTop + focus;
 
     final int index = _SliverAnimatedZoomGridLayout.minChildIndexIn(
@@ -775,7 +811,16 @@ class FolderZoomViewportTracker {
   }) {
     final double preferred = focusFraction.clamp(0.0, 1.0) * height;
 
-    final double topBlend = (1.0 - viewportTop / height).clamp(0.0, 1.0);
+    // 距顶不足一屏时把焦点渐变到 `0`，让顶端退化成"顶对齐"、不撞滚动边界。
+    //
+    // 但这个渐变只在**内容起始边已经被推到视口顶端之上**时才成立：上方还有
+    // header 时起始边在视口顶端之下（`viewportTop < 0`），向上余量是整个 header，
+    // 此时压焦点等于跳过补偿，用户看到的焦点内容会被整体甩走。这种情形交给
+    // `_recordAnchor` 里的 `focus = max(focus, -viewportTop)` 兜底：焦点落到内容
+    // 之外才退化成顶对齐，否则正常按焦点锚定。
+    final double topBlend = viewportTop < 0.0
+        ? 0.0
+        : (1.0 - viewportTop / height).clamp(0.0, 1.0);
     double focus = lerpDouble(preferred, 0.0, topBlend)!;
 
     final double? maxOffset = maxScrollOffsetFor(layer, isPortrait: isPortrait);
@@ -838,7 +883,10 @@ class FolderZoomViewportTracker {
   }) {
     switch (_anchorEdge) {
       case _ZoomAnchorEdge.top:
-        return 0.0;
+        // 页面已经在最顶端：目标就是"原地别动"，也就是把列表起始边钉在它此刻
+        // 所在的屏幕位置上。直接返回 0 是不对的 —— 上方还有 header / padding 时，
+        // 列表起始边的正确目标是个负数（`-precede` 起）。
+        return anchorSourceTop;
       case _ZoomAnchorEdge.bottom:
         final source = steadyLayer;
         if (source == null) return viewportTop;
@@ -866,7 +914,9 @@ class FolderZoomViewportTracker {
       final double? maxOffset = maxScrollOffsetFor(layer, isPortrait: isPortrait);
       if (maxOffset != null) top = math.min(top, maxOffset);
     }
-    return math.max(0.0, top);
+    // 下界是"页面滚到 0"对应的坐标，不是 0：上方还有 header / padding 时它是负的。
+    // 按 0 截断会把贴顶换档的目标算成"往上滚一整个 header 的高度"。
+    return math.max(minViewportTop, top);
   }
 
   /// 把焦点锚换算到 [layer] 档位的目标视口顶部偏移（不含残差修正、不夹取）。
@@ -2668,9 +2718,28 @@ class SliverAnimatedZoomGridDelegate extends SliverGridDelegate {
   @override
   SliverGridLayout getLayout(SliverConstraints constraints) {
     final usableWidth = math.max(1.0, constraints.crossAxisExtent);
-    final viewportTop = constraints.scrollOffset;
-    final viewportBottom =
-        constraints.scrollOffset + constraints.remainingPaintExtent;
+
+    // 视口顶端在 sliver 坐标系里的位置。
+    //
+    // 不能直接用 `constraints.scrollOffset`：当这个 sliver 的起始边还在视口顶端
+    // **之下**（上方还有别的 sliver / `SliverPadding`，页面还没滚到列表），Flutter
+    // 会把 `scrollOffset` 钳在 0（`RenderViewportBase.layoutChildSequence` 里
+    // `scrollOffset <= 0 ? 0 : scrollOffset`），真实的负值被吃掉。此时"起始边到
+    // 视口顶端的距离"只能从剩余绘制长度反推：
+    //
+    //   remainingPaintExtent == 视口主轴向长度 - 起始边到视口顶端的距离
+    //
+    // 少了这一步，`viewportTop` 恒为 0，锚定会把这种情况误判成"列表已贴顶"，
+    // 换档 / 捏合时直接跳过滚动补偿（内容只在原地往下长）。
+    final double leadingGap = math.max(
+      0.0,
+      constraints.viewportMainAxisExtent - constraints.remainingPaintExtent,
+    );
+    final double viewportTop = constraints.scrollOffset - leadingGap;
+    // 视口底端 = 顶端 + 视口主轴向长度（`viewportHeight` 必须是**视口高**，
+    // 而不是 `remainingPaintExtent`：后者已经被上方的 header 吃掉一截）。
+    final double viewportBottom =
+        viewportTop + constraints.viewportMainAxisExtent;
     final layers = metrics.resolvedGeometryLayers;
     final tracker = metrics.viewportTracker;
     if (tracker != null) {

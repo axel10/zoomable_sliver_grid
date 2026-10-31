@@ -131,3 +131,39 @@ Everything else follows from this:
 
 The practical effect: the items visible before a tier change are, as far as the new layout allows,
 still visible after it, and the ones that must fade in/out are the fewest possible.
+
+## Grid below other slivers
+
+The grid does not have to start at the top of the page. Putting a banner, a `SliverPersistentHeader`
+or a `SliverAppBar` above it is supported:
+
+```dart
+CustomScrollView(
+  slivers: [
+    SliverAppBar(pinned: true, title: Text('Library')),
+    SliverToBoxAdapter(child: FeaturedBanner()),
+    SliverPadding(padding: ..., sliver: SliverGrid(gridDelegate: SliverAnimatedZoomGridDelegate(...))),
+  ],
+)
+```
+
+What matters is the coordinate frame: `SliverConstraints.scrollOffset` is **clamped to 0** by Flutter
+whenever the sliver's leading edge is still *below* the viewport's leading edge, so it cannot be used
+as "the scroll position of the grid". The package derives the real value instead:
+
+```text
+leadingGap = max(0, viewportMainAxisExtent - remainingPaintExtent)   // header + outer padding
+viewportTop = scrollOffset - leadingGap                              // negative while the header is visible
+viewportBottom = viewportTop + viewportMainAxisExtent
+```
+
+With that, `viewportTop = pixels - precedingContentExtent` holds everywhere, which is what the anchor
+math, `viewportHeight`, `maxScrollExtent` clamping and the pinch path all rely on. Consequences worth
+knowing:
+
+- While part of the header is still on screen, the focus is the viewport center as usual, and a tier
+  change scrolls the page (and the header) as needed to keep the content under the focus in place.
+- At the very top of the page (`pixels == 0`) there is no room to scroll up, so a tier change degrades
+  to "keep the grid's first item where it is" and never yanks the page down.
+- Bottom edge detection / clamping is exact with a header in place, because
+  `maxScrollOffsetFor` is computed from the real viewport height rather than from the paint extent.
