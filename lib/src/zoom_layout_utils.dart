@@ -837,10 +837,23 @@ class FolderZoomViewportTracker {
   }
 
   /// 本段起始边在页面坐标里的位置（按 [layer] 档位）。
+  ///
+  /// 上游有一段高度未知时不做跨段补偿，退回**本帧实测到的** `precede`（它一直
+  /// 是准的，来自真实布局）。这条与 `gapReady == false` 的处理同源：数据不够时
+  /// 宁可退回"本段局部坐标"，也不要按错误的上游高度把整段挪走。
+  ///
+  /// 为什么"未知"会致命：条目数只由 `computeMaxScrollOffset` 回填，而
+  /// `RenderSliverGrid` 在"一次就把内容铺到底"（`reachedEnd`）时**根本不会调它**
+  /// —— 短列表（几个根目录、几个服务器）永远学不到自己的条目数。此时若按 0 高
+  /// 外推上游，本段起始位置就少了整整一个上游段的高度（实测 280.5px），条目被
+  /// 整体摆到段内容起点之上，`RenderSliverGrid` 于是报出负的 `scrollExtent`。
   double _pageStartIn(_ZoomSectionState s, FolderZoomGeometryLayer layer) {
     double start = s.gapBefore;
     for (final other in _ordered) {
       if (identical(other, s)) break;
+      if ((other.contentCount ?? 0) <= 0) {
+        return s.hasMeasurement ? s.precede : start;
+      }
       start += _extentIn(other, layer);
     }
     return start;
@@ -853,6 +866,9 @@ class FolderZoomViewportTracker {
     double start = s.gapBefore;
     for (final other in _ordered) {
       if (identical(other, s)) break;
+      if ((other.contentCount ?? 0) <= 0) {
+        return s.hasMeasurement ? s.precede : start;
+      }
       start += _mixedExtent(other, layers);
     }
     return start;
@@ -1421,6 +1437,21 @@ class FolderZoomViewportTracker {
         // 淡出锁在"现在的位置"，淡入锁在"将要落到的位置"。
         lockedTop = kind == FolderZoomItemPin.fadeOut ? top : targetTop;
         opacityFrom = kind == FolderZoomItemPin.fadeOut ? 1.0 : 0.0;
+
+        // 只有"画得出来"的锁定位置才值得冻结。
+        //
+        // 布局侧把锁定条目放在 `scrollOffset = viewportTop + 锁定屏幕 y`，而
+        // 条目不能画在本段起始边**之上**（偏移为负，`_clampPinned` 会把它夹回
+        // 0）：一旦夹取生效，条目就变成"骑在起始边上跟整段一起移动"，等起始边
+        // 越过它再弹回锁定位置 —— 屏幕上就是"下面的元素在动画期间被顶到上面来"。
+        //
+        // 本段起始边还在视口顶端**之下**时（`viewportTop < 0`，典型就是"一页两个
+        // 列表，第二个列表整段还在屏幕外"），淡入条目的锁定位置（目标档位的屏幕
+        // y）必然在起始边之上，整段都画不出来。这一段该有的表现是"跟着几何一起
+        // 上移"（上游变矮它就整体上移），所以退回 [shared]，交给加权位移。
+        if (lockedTop + s.viewportTop < -kFolderZoomVisibilityEpsilon) {
+          kind = FolderZoomItemPin.shared;
+        }
       }
 
       if (segmentFirst == null ||
@@ -3229,11 +3260,31 @@ class SliverAnimatedZoomGridDelegate extends SliverGridDelegate {
     //
     // 少了这一步，`viewportTop` 恒为 0，锚定会把这种情况误判成"列表已贴顶"，
     // 换档 / 捏合时直接跳过滚动补偿（内容只在原地往下长）。
-    final double leadingGap = math.max(
-      0.0,
-      constraints.viewportMainAxisExtent - constraints.remainingPaintExtent,
-    );
-    final double viewportTop = constraints.scrollOffset - leadingGap;
+    //
+    // 但这个反推式只在 `remainingPaintExtent > 0` 时成立：起始边落到视口**底端
+    // 之下**（整段都还没进屏幕）时，父级把 `remainingPaintExtent` 夹成 0，反推
+    // 出来恒等于视口高度 —— 无论它其实在折叠线下 20px 还是 200px（缓存范围内
+    // 照样会被布局）。少算的这段距离会一路传进 `precede` / `gapBefore`/
+    // `pageStart`：换档时下游这一段的所有条目都被按错位摆位置（表现为"下面的
+    // 列表在动画期间整体偏高，收尾那帧再弹回来"）。
+    // 这种情形改用 `precedingScrollExtent`：它是"本 sliver 之前所有内容的滚动
+    // 长度"，与 `pixels` 同一坐标系，`pixels - precedingScrollExtent` 就是精确值。
+    final double viewportTop;
+    if (constraints.remainingPaintExtent > 0.0) {
+      viewportTop = constraints.scrollOffset -
+          math.max(
+            0.0,
+            constraints.viewportMainAxisExtent -
+                constraints.remainingPaintExtent,
+          );
+    } else {
+      final double? pixels = metrics.viewportTracker?.scrollPixelsReader?.call();
+      viewportTop = pixels == null
+          // 读不到滚动位置时退回旧口径：宁可少算前置内容，也不能把坐标算成
+          // 跟滚动位置无关的常量。
+          ? constraints.scrollOffset - constraints.viewportMainAxisExtent
+          : pixels - constraints.precedingScrollExtent;
+    }
     // 视口底端 = 顶端 + 视口主轴向长度（`viewportHeight` 必须是**视口高**，
     // 而不是 `remainingPaintExtent`：后者已经被上方的 header 吃掉一截）。
     final double viewportBottom =
@@ -3257,6 +3308,18 @@ class SliverAnimatedZoomGridDelegate extends SliverGridDelegate {
         section: section,
       );
     }
+    _probeLayoutFrame(
+      section: section,
+      constraints: constraints,
+      viewportTop: viewportTop,
+      viewportBottom: viewportBottom,
+      usableWidth: usableWidth,
+      outerWidth: metrics.outerWidth,
+      layers: layers,
+      tracker: tracker,
+      progress: metrics.transitionProgress,
+      hasPinning: layers.length > 1 && metrics.pinningFor(section) != null,
+    );
     return _SliverAnimatedZoomGridLayout(
       usableWidth: usableWidth,
       outerWidth: metrics.outerWidth,
@@ -3271,6 +3334,10 @@ class SliverAnimatedZoomGridDelegate extends SliverGridDelegate {
       section: section,
       pinning: layers.length > 1 ? metrics.pinningFor(section) : null,
       progress: metrics.transitionProgress,
+      debugScrollOffset: constraints.scrollOffset,
+      debugPrecedingExtent: constraints.precedingScrollExtent,
+      debugRemainingPaintExtent: constraints.remainingPaintExtent,
+      debugViewportExtent: constraints.viewportMainAxisExtent,
     );
   }
 
@@ -3301,6 +3368,66 @@ class SliverAnimatedZoomGridDelegate extends SliverGridDelegate {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 几何探针
+//
+// 只服务于排查（开关见 [folderZoomGeometryProbe]），不参与任何计算。目标是把
+// 「某一段报出负的 scrollExtent」时几套坐标系的实际取值一次打全：
+// delegate 换算出的 `viewportTop`、tracker 里该段记的 `viewportTop / precede`、
+// 各档位层自己的视口顶部与条目偏移、以及冻结表给出的屏幕位置。
+// ---------------------------------------------------------------------------
+
+String _probeSectionTag(Object? section) => section == null ? 'null' : '$section';
+
+String _probeLayersTag(List<FolderZoomGeometryLayer> layers) =>
+    layers.map(FolderZoomViewportTracker._layerTag).join(',');
+
+String _probeSectionState(FolderZoomViewportTracker? tracker, Object? section) {
+  final s = tracker?._sections[section];
+  if (s == null) return 'sec=absent';
+  return 'sec{top=${zd(s.viewportTop)} precede=${zd(s.precede)} '
+      'gap=${zd(s.gapBefore)} gapReady=${s.gapReady} '
+      'count=${s.contentCount} measured=${s.hasMeasurement} '
+      'remPaint=${zd(s.remainingPaintExtent)} frame=${s.frameIndex}}';
+}
+
+/// 每帧一行的布局参数快照；几何状态不变时静默。
+void _probeLayoutFrame({
+  required Object? section,
+  required SliverConstraints constraints,
+  required double viewportTop,
+  required double viewportBottom,
+  required double usableWidth,
+  required double outerWidth,
+  required List<FolderZoomGeometryLayer> layers,
+  required FolderZoomViewportTracker? tracker,
+  required double progress,
+  required bool hasPinning,
+}) {
+  final double? pixels = tracker?.scrollPixelsReader?.call();
+  final String signature = 'frame|${_probeSectionTag(section)}|'
+      '${zd(viewportTop)}|${zd(constraints.scrollOffset)}|'
+      '${zd(constraints.remainingPaintExtent)}|'
+      '${zd(constraints.viewportMainAxisExtent)}|'
+      '${_probeLayersTag(layers)}|${zd(progress, 2)}|$hasPinning|'
+      '${tracker?._sections[section]?.contentCount}|'
+      '${zd(tracker?._sections[section]?.viewportTop)}';
+  zoomGeomProbe(signature, () {
+    return 'layout section=${_probeSectionTag(section)} '
+        'layers=${_probeLayersTag(layers)} progress=${zd(progress, 2)} '
+        'pinning=$hasPinning '
+        'viewportTop=${zd(viewportTop)} bottom=${zd(viewportBottom)} | '
+        'scrollOffset=${zd(constraints.scrollOffset)} '
+        'preceding=${zd(constraints.precedingScrollExtent)} '
+        'remPaint=${zd(constraints.remainingPaintExtent)} '
+        'viewportH=${zd(constraints.viewportMainAxisExtent)} '
+        'cacheOrigin=${zd(constraints.cacheOrigin)} | '
+        'usableW=${zd(usableWidth)} outerW=${zd(outerWidth)} '
+        'pixels=${zd(pixels)} | '
+        '${_probeSectionState(tracker, section)}';
+  }, throttled: true);
+}
+
 class _SliverAnimatedZoomGridLayout extends SliverGridLayout {
   const _SliverAnimatedZoomGridLayout({
     required this.usableWidth,
@@ -3316,6 +3443,10 @@ class _SliverAnimatedZoomGridLayout extends SliverGridLayout {
     this.section,
     this.pinning,
     this.progress = 0.0,
+    this.debugScrollOffset = 0.0,
+    this.debugPrecedingExtent = 0.0,
+    this.debugRemainingPaintExtent = 0.0,
+    this.debugViewportExtent = 0.0,
   });
 
   final double usableWidth;
@@ -3328,6 +3459,21 @@ class _SliverAnimatedZoomGridLayout extends SliverGridLayout {
   final double gridCrossAxisSpacing;
   final double gridMainAxisSpacing;
   final FolderZoomViewportTracker? tracker;
+
+  // 下面四个只是把本帧的 `SliverConstraints` 抄一份进来，**仅用于几何探针输出**，
+  // 不参与任何计算。
+
+  /// 本帧 `SliverConstraints.scrollOffset`。
+  final double debugScrollOffset;
+
+  /// 本帧 `SliverConstraints.precedingScrollExtent`。
+  final double debugPrecedingExtent;
+
+  /// 本帧 `SliverConstraints.remainingPaintExtent`。
+  final double debugRemainingPaintExtent;
+
+  /// 本帧 `SliverConstraints.viewportMainAxisExtent`。
+  final double debugViewportExtent;
 
   /// 本网格所属的段；一页多网格时靠它取到自己那一份视口顶部与冻结表。
   final Object? section;
@@ -3438,6 +3584,52 @@ class _SliverAnimatedZoomGridLayout extends SliverGridLayout {
 
   @override
   SliverGridGeometry getGeometryForChildIndex(int index) {
+    final geometry = _resolveGeometryForChildIndex(index);
+    // 负偏移 = 条目被摆到段起点之上；非正高度 = 布局档位几何退化。两者都会让
+    // `RenderSliverGrid` 报出非法的 `scrollExtent`（负数 / 与 paintExtent 相冲）。
+    if (geometry.scrollOffset < 0.0 || geometry.mainAxisExtent <= 0.0) {
+      _probeNegativeChild(index, geometry);
+    }
+    return geometry;
+  }
+
+  /// 条目 [`index`] 的偏移算成了负数（或高度非正）。负偏移这一条会被摆到本段
+  /// 内容起点之上，`RenderSliverGrid` 于是拿它当 `trailingScrollOffset` 报负的
+  /// `scrollExtent`。
+  void _probeNegativeChild(int index, SliverGridGeometry geometry) {
+    final pin = pinning?.pinInfoOf(index);
+    final String signature = 'child|${_probeSectionTag(section)}|$index|'
+        '${zd(geometry.scrollOffset)}|${zd(viewportTop)}|'
+        '${_probeLayersTag(layers)}|${pin?.kind.name}|${zd(progress, 2)}';
+    zoomGeomProbe(signature, () {
+      final parts = <String>[
+        'child section=${_probeSectionTag(section)} index=$index '
+            'offset=${zd(geometry.scrollOffset)} '
+            'extent=${zd(geometry.mainAxisExtent)} '
+            'cross=${zd(geometry.crossAxisOffset)}',
+        'viewportTop=${zd(viewportTop)} '
+            'scrollOffset=${zd(debugScrollOffset)} '
+            'preceding=${zd(debugPrecedingExtent)} '
+            'remPaint=${zd(debugRemainingPaintExtent)} '
+            'viewportH=${zd(debugViewportExtent)}',
+        'layers=${_probeLayersTag(layers)} single=$_hasSingleLayer '
+            'progress=${zd(progress, 2)}',
+      ];
+      for (final layer in layers) {
+        final layerGeometry = _geometryIn(layer, index);
+        parts.add('lyr[${FolderZoomViewportTracker._layerTag(layer)} '
+            'top=${zd(_layerViewportTop(layer))} '
+            'offset=${zd(layerGeometry.scrollOffset)}]');
+      }
+      if (pin != null) {
+        parts.add('pin=${pin.kind.name} frozenTop=${zd(pin.top)}');
+      }
+      parts.add(_probeSectionState(tracker, section));
+      return parts.join(' | ');
+    });
+  }
+
+  SliverGridGeometry _resolveGeometryForChildIndex(int index) {
     if (_hasSingleLayer) {
       return _geometryIn(layers.first, index);
     }
@@ -3540,7 +3732,10 @@ class _SliverAnimatedZoomGridLayout extends SliverGridLayout {
   /// 发生在正在淡入 / 淡出的条目上（不可见或正在消失）。
   double _clampPinned(double offset, double extent) {
     final int? count = tracker?.contentCountOf(section);
-    if (count == null || count <= 0) return offset;
+    if (count == null || count <= 0) {
+      _probePinnedClamp('无条目数', offset, offset, 0.0, count);
+      return offset;
+    }
     double end = 0.0;
     for (final layer in layers) {
       end += _maxScrollOffsetIn(layer, count) * layer.weight;
@@ -3548,7 +3743,33 @@ class _SliverAnimatedZoomGridLayout extends SliverGridLayout {
     final double maxOffset = math.max(0.0, end - extent);
     // 上界：不能越过内容末端；下界：不能高于内容起点（否则 `paintExtent` 的
     // `from` 会被拉到负值，同样把高度算多）。
-    return offset.clamp(0.0, maxOffset);
+    final double clamped = offset.clamp(0.0, maxOffset);
+    if ((clamped - offset).abs() > 0.5) {
+      _probePinnedClamp('挤出内容范围', offset, clamped, maxOffset, count);
+    }
+    return clamped;
+  }
+
+  /// 冻结的屏幕位置被夹回（或压根没有条目数可夹）时打一条 —— 说明
+  /// `viewportTop + 冻结屏幕 y` 这套换算和本段的实际内容范围对不上。
+  void _probePinnedClamp(
+    String reason,
+    double offset,
+    double clamped,
+    double maxOffset,
+    int? count,
+  ) {
+    final String signature = 'clamp|${_probeSectionTag(section)}|$reason|'
+        '${zd(offset)}|${zd(clamped)}|${zd(viewportTop)}';
+    zoomGeomProbe(signature, () {
+      return 'pinClamp[$reason] section=${_probeSectionTag(section)} '
+          'offset=${zd(offset)} -> ${zd(clamped)} '
+          'maxOffset=${zd(maxOffset)} count=$count '
+          'viewportTop=${zd(viewportTop)} '
+          'scrollOffset=${zd(debugScrollOffset)} '
+          'preceding=${zd(debugPrecedingExtent)} | '
+          '${_probeSectionState(tracker, section)}';
+    });
   }
 
   static double mainStrideFor({
@@ -3735,6 +3956,28 @@ class _SliverAnimatedZoomGridLayout extends SliverGridLayout {
   double computeMaxScrollOffset(int childCount) {
     // 回填条目总数：tracker 要在换算目标档位的滚动偏移时按各档位的内容总高求解。
     tracker?.setContentCount(section, childCount);
+    final double result = _computeMaxScrollOffsetIn(childCount);
+    final String signature = 'max|${_probeSectionTag(section)}|$childCount|'
+        '${zd(result)}|${_probeLayersTag(layers)}';
+    zoomGeomProbe(signature, () {
+      final parts = <String>[
+        'maxScroll section=${_probeSectionTag(section)} count=$childCount '
+            'result=${zd(result)} layers=${_probeLayersTag(layers)} '
+            'viewportTop=${zd(viewportTop)} '
+            'scrollOffset=${zd(debugScrollOffset)}',
+      ];
+      if (childCount > 0) {
+        for (final layer in layers) {
+          parts.add('extent[${FolderZoomViewportTracker._layerTag(layer)}'
+              ']=${zd(_maxScrollOffsetIn(layer, childCount))}');
+        }
+      }
+      return parts.join(' | ');
+    }, throttled: true);
+    return result;
+  }
+
+  double _computeMaxScrollOffsetIn(int childCount) {
     if (childCount <= 0) return 0.0;
     if (_hasSingleLayer) {
       return _maxScrollOffsetIn(layers.first, childCount);

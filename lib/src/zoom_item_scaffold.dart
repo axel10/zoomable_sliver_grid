@@ -743,22 +743,32 @@ class ZoomItemScaffold extends StatelessWidget {
               )
             : itemContent;
 
-        if (isFadeScale) {
-          if (!identical(effectiveMetrics, metrics)) {
-            result = ZoomItemEffectiveMetrics(
+        // 这三层包装必须**常驻**，不能在过渡开始 / 结束时按条件增删。
+        //
+        // 它们一增删，`LayoutBuilder` 之下的根 Widget 类型就变了，Flutter 无法复用
+        // 旧 Element，只能把整条子树 deactivate 重建 —— 条目内部的 `SongThumbnail`
+        // 等有状态组件会丢掉 State。单侧可见条目正好在过渡**收尾**那一帧从
+        // `Opacity > Transform > ZoomItemEffectiveMetrics > HoverableCard`
+        // 塌缩成 `HoverableCard`，于是刚淡入完的封面被销毁重建：
+        // 有封面的条目靠 ImageCache 同步出图、看不出来，而落定为默认图标的条目
+        // `_isGenerating` 回到 true，会先空白一两帧再重新解析出来（观感就是
+        // 「淡入结束之后默认图标闪一下」）。
+        // 代价只有两个 render object：`Opacity` 在 1.0 时直接透传不建图层，
+        // `Transform` 在单位矩阵下只是一次 canvas 变换。
+        final double itemOpacity =
+            isFadeScale ? transition.opacity.clamp(0.0, 1.0) : 1.0;
+        final double itemScale = isFadeScale ? transition.scale : 1.0;
+        result = Opacity(
+          opacity: itemOpacity,
+          child: Transform.scale(
+            scale: itemScale,
+            alignment: Alignment.center,
+            child: ZoomItemEffectiveMetrics(
               metrics: effectiveMetrics,
               child: result,
-            );
-          }
-          result = Opacity(
-            opacity: transition.opacity.clamp(0.0, 1.0),
-            child: Transform.scale(
-              scale: transition.scale,
-              alignment: Alignment.center,
-              child: result,
             ),
-          );
-        }
+          ),
+        );
 
         return result;
       },
