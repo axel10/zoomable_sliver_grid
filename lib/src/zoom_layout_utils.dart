@@ -1828,6 +1828,79 @@ const double kFolderZoomContentHandoffFadeHalfWindow = 0.12;
 /// 完全看不见的那几帧里，视觉上只剩"淡出 → 淡入"。
 const double kFolderZoomContentHandoffMinOpacity = 0.0;
 
+/// 向 [FolderZoomSliverBuilder] 的整棵子树下发当前帧的 [FolderZoomLayoutMetrics]。
+///
+/// 一个页面里有多段可缩放列表时，各段**必须**共用同一个 builder：滚动补偿按页面
+/// 坐标统一结算，各段自己建 builder 会互相顶走（上游那一段在下游的 tracker 里根本
+/// 不存在，换档后下游只按自己的局部坐标补偿，被上游的高度变化顶掉一截；两个
+/// builder 还会同时往同一个 [ScrollPosition] 写像素值）。
+///
+/// 有了这个 scope，段组件不必再手工把 metrics 从页面传下来 —— 见
+/// [FolderZoomSectionHost]。
+///
+/// 注意它只描述**页面级**度量，不参与"单侧可见条目"那种条目级锁定（那是
+/// `ZoomItemEffectiveMetrics` 的职责，优先级更高）。
+class FolderZoomMetricsScope extends InheritedWidget {
+  const FolderZoomMetricsScope({
+    super.key,
+    required this.metrics,
+    required super.child,
+  });
+
+  final FolderZoomLayoutMetrics metrics;
+
+  static FolderZoomLayoutMetrics? maybeOf(BuildContext context) {
+    return context
+        .dependOnInheritedWidgetOfExactType<FolderZoomMetricsScope>()
+        ?.metrics;
+  }
+
+  @override
+  bool updateShouldNotify(FolderZoomMetricsScope oldWidget) =>
+      !identical(oldWidget.metrics, metrics);
+}
+
+/// 一个"缩放段"的容器：祖先有 [FolderZoomMetricsScope] 就直接用页面下发的度量，
+/// 否则自建一个 [FolderZoomSliverBuilder]。
+///
+/// 用途是让同一份列表组件既能作为多段页面里的一段（由页面统一提供 builder），
+/// 也能单独成页（组件自己就是宿主）。相比"给列表组件加一个可选 `metrics` 参数"，
+/// 这里的判据是**树的位置**而不是调用方有没有记得传值：漏传会在结构上退回
+/// 多 builder（补偿互相顶走），而这里不可能漏。
+class FolderZoomSectionHost extends StatelessWidget {
+  const FolderZoomSectionHost({
+    super.key,
+    required this.zoomScale,
+    required this.width,
+    required this.builder,
+    this.controller,
+  });
+
+  /// 只在没有祖先 scope（即本段自己就是宿主）时用到。
+  final double zoomScale;
+
+  /// 只在没有祖先 scope 时用到。
+  final double width;
+
+  /// 只在没有祖先 scope 时传给自建的 builder。
+  final ScrollController? controller;
+
+  final Widget Function(BuildContext context, FolderZoomLayoutMetrics metrics)
+      builder;
+
+  @override
+  Widget build(BuildContext context) {
+    final hostMetrics = FolderZoomMetricsScope.maybeOf(context);
+    if (hostMetrics != null) return builder(context, hostMetrics);
+    return FolderZoomSliverBuilder(
+      zoomScale: zoomScale,
+      width: width,
+      controller: controller,
+      builder: builder,
+    );
+  }
+}
+
 /// Animates [FolderZoomLayoutMetrics] smoothly whenever `zoomScale` changes,
 /// and returns the sliver built by [builder].
 class FolderZoomSliverBuilder extends StatefulWidget {
@@ -3036,7 +3109,10 @@ class _FolderZoomSliverBuilderState extends State<FolderZoomSliverBuilder>
         ),
         viewportTracker: _viewportTracker,
       );
-      return widget.builder(context, metrics);
+      return FolderZoomMetricsScope(
+        metrics: metrics,
+        child: widget.builder(context, metrics),
+      );
     }
 
     final double progress = _curved.value;
@@ -3095,7 +3171,10 @@ class _FolderZoomSliverBuilderState extends State<FolderZoomSliverBuilder>
       ),
       viewportTracker: _viewportTracker,
     );
-    return widget.builder(context, metrics);
+    return FolderZoomMetricsScope(
+      metrics: metrics,
+      child: widget.builder(context, metrics),
+    );
   }
 }
 

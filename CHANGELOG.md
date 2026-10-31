@@ -1,5 +1,15 @@
 ## 未发布
 
+* **新增 `FolderZoomSectionHost` / `FolderZoomMetricsScope`**：让同一份列表组件既能单独成页，
+  也能作为多段页面里的一段，不必再给它加一个可选 `metrics` 参数。
+  [FolderZoomSliverBuilder] 现在会把当前帧的 [FolderZoomLayoutMetrics] 放进
+  `FolderZoomMetricsScope` 下发给整棵子树；列表组件只要用
+  `FolderZoomSectionHost(zoomScale:, width:, builder:)` 包住自己——祖先有 scope 就复用页面
+  度量，没有就自建 builder。判据是**树的位置**而不是调用方有没有记得传值：漏传参数会静默
+  退回"每段一个 builder"（各段补偿互相顶走），而漏包宿主不可能发生。
+  一页一段的现有代码零改动。
+* **测试**：新增 `test/zoom_section_host_test.dart`（2 例：多段共用同一个 builder 且各段拿到
+  同一份度量 / 无祖先时本段自己就是宿主）。
 * **支持"一个页面里多个缩放列表"**：一个 [FolderZoomSliverBuilder] 下可以挂多个网格
   （目录列表 → 固定高的介绍行 → 文件列表这类结构）。用
   `SliverAnimatedZoomGridDelegate(section: ...)` 声明身份、`ZoomItemScaffold(section: ...)`

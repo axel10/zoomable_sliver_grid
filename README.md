@@ -208,6 +208,41 @@ Both `section` values must be distinct, and the same value must be passed to `Zo
 each section numbers its items from `0`, so the fade-in/fade-out classification has to be looked up
 per section.
 
+### Wrapping a section in its own widget
+
+A real app rarely inlines the grid; it has a `FolderSongsSliver` / `FileListSliver` component. Such a
+component must **not** build its own `FolderZoomSliverBuilder` — wrap it in `FolderZoomSectionHost`
+instead. The host reuses the metrics published by the enclosing builder (`FolderZoomMetricsScope`)
+and only builds one itself when there is no ancestor, which is exactly the single-list case:
+
+```dart
+class FileListSliver extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return FolderZoomSectionHost(
+      zoomScale: zoomScale,
+      width: width,
+      builder: (context, metrics) => SliverGrid(
+        gridDelegate: SliverAnimatedZoomGridDelegate(metrics: metrics, section: 'files'),
+        delegate: SliverChildBuilderDelegate(
+          (context, index) => ZoomItemScaffold(
+            metrics: metrics,
+            section: 'files',
+            titleText: items[index].name,
+          ),
+          childCount: items.length,
+        ),
+      ),
+    );
+  }
+}
+```
+
+Passing the metrics down by hand (an optional `metrics` field on every list widget) also works, but its
+failure mode is silent: forget it once and the page quietly falls back to one builder per list, where
+each list compensates against its own local coordinates and they shove each other around. The host can
+never be forgotten — it keys off *where the widget sits in the tree*, not off an argument.
+
 The scroll solve moves to **page coordinates**:
 
 ```text
