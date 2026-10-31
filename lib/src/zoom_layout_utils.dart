@@ -1250,16 +1250,19 @@ class FolderZoomViewportTracker {
     double top = page + correction - _pageStartIn(s, layer);
     // 底部贴边时 `targetPixelsForLayer` 已经精确给出贴底位置，不要再夹取。
     if (_anchorEdge != _ZoomAnchorEdge.bottom) {
-      final double maxTop = maxPagePixelsFor(layer) - _pageStartIn(s, layer);
-      final double clamped = math.min(top, maxTop);
-      if ((clamped - top).abs() > 0.5) {
-        zoomLog('probe', () {
-          return 'layerTop clamped ${zd(top)} -> ${zd(clamped)} '
-              'maxTop=${zd(maxTop)} tail=${zd(tailExtent)} '
-              'layer=${_layerTag(layer)}';
-        });
+      final double? maxTop =
+          maxViewportTopFor(layer, section: section, isPortrait: isPortrait);
+      if (maxTop != null) {
+        final double clamped = math.min(top, maxTop);
+        if ((clamped - top).abs() > 0.5) {
+          zoomLog('probe', () {
+            return 'layerTop clamped ${zd(top)} -> ${zd(clamped)} '
+                'maxTop=${zd(maxTop)} tail=${zd(tailExtent)} '
+                'layer=${_layerTag(layer)}';
+          });
+        }
+        top = clamped;
       }
-      top = clamped;
     }
     // 下界是"页面滚到 0"对应的坐标，不是 0：上方还有 header / padding 时它是负的。
     return math.max(-s.precede, top);
@@ -3338,6 +3341,7 @@ class _SliverAnimatedZoomGridLayout extends SliverGridLayout {
   bool get _hasSingleLayer => layers.length == 1;
 
   double _layerViewportTop(FolderZoomGeometryLayer layer) {
+    if (_hasSingleLayer) return viewportTop;
     if (tracker == null || !tracker!.hasMeasurement) return viewportTop;
     return tracker!.viewportTopForLayer(
       layer,
