@@ -1,3 +1,16 @@
+## 未发布
+
+* **修复「滚到列表底部后捏合换档，整片内容偏下」**：捏合路径曾按目标档位的
+  `maxScrollOffsetFor()` 夹取目标滚动位置，那是 **sliver 坐标**（`内容总高 - 视口高`，
+  不含外层 `SliverPadding`），而目标值是滚动像素——两者相差一个 `precede`
+  （上方 header / padding 高度）加尾部 padding。于是只有贴底这一种情形会露馅：
+  点击档位精确贴底，捏合却提前停下 `precede + 尾部 padding` 那么多，最后一行被切掉一截。
+  header 越高偏得越多（实测无 header 32px、400px header 432px）。
+  现在与点击路径一致**不按上界夹取**，越界交给本次布局的 `applyContentDimensions` 纠正。
+* **测试**：新增 `test/zoom_bottom_pinch_matches_tap_test.dart`，在"无 header / 400px header"
+  × 放大 / 缩小 四种组合下比对两条路径的最终滚动像素与每一条的屏幕位置，要求逐条对齐。
+  已验证修复前失败（少滚 32px / 432px）。
+
 ## 0.0.4
 
 * **适配"缩放列表上方还有别的组件"**：调用方在列表上方放了 header / banner / `SliverAppBar`

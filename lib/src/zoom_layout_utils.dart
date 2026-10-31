@@ -1980,17 +1980,21 @@ class _FolderZoomSliverBuilderState extends State<FolderZoomSliverBuilder>
         targetLayer,
         isPortrait: isPortrait,
       );
-      // 按**目标档位**的最大偏移夹取，而不是当前（旧档位）的 `maxScrollExtent`：
-      // 过渡期内容总高每帧都在变，旧值会让缩小方向的目标被提前截断。
-      final maxPixels = _viewportTracker.maxScrollOffsetFor(
-            targetLayer,
-            isPortrait: isPortrait,
-          ) ??
-          _maxExtentOf(position) ??
-          0.0;
-      _pinchTargetPixels = (_pinchBasePixels +
-              (targetTop - _pinchBaseSliverOffset))
-          .clamp(0.0, math.max(0.0, maxPixels));
+      // 上界**不夹取**，与点击档位那条路（`_applyTargets`）保持完全一致。
+      //
+      // 曾经这里按目标档位的 `maxScrollOffsetFor()` 夹取，那是个**单位错误**：
+      // `maxScrollOffsetFor()` 返回的是 sliver 坐标（`内容总高 - 视口高`，且不含
+      // 外层 `SliverPadding`），而 `_pinchTargetPixels` 是滚动像素 —— 两者相差
+      // 一个 `precede`（上方 padding / header 的高度）加上尾部 padding。于是只要
+      // 滚到列表底部，捏合的目标就被少算 `precede + 尾部 padding` 那么多：
+      // 点击换档精确贴底，捏合却停在离底还差一截的位置，整片内容偏下、最后一行
+      // 被切掉。header 越高偏得越多（实测 32px 到 400px 以上）。
+      //
+      // 越界交给本次布局的 `applyContentDimensions` 纠正，和点击路径同款处理。
+      _pinchTargetPixels = math.max(
+        0.0,
+        _pinchBasePixels + (targetTop - _pinchBaseSliverOffset),
+      );
       _pinchTargetScale = pinch.targetZoomScale;
       zoomLog('pinch', () {
         return 'solve target=${zd(pinch.targetZoomScale, 3)} '
@@ -1998,7 +2002,7 @@ class _FolderZoomSliverBuilderState extends State<FolderZoomSliverBuilder>
             'baseSliver=${zd(_pinchBaseSliverOffset)} '
             'targetTop=${zd(targetTop)} '
             'targetPx=${zd(_pinchTargetPixels)} '
-            'maxTarget=${zd(maxPixels)} '
+            'maxTarget=${zd(_viewportTracker.maxScrollOffsetFor(targetLayer, isPortrait: isPortrait))} '
             'maxCur=${zd(_maxExtentOf(position))} '
             'anchor=${_viewportTracker.anchorEdgeName}'
             '#${_viewportTracker.anchorIndex} '
