@@ -1,5 +1,15 @@
 ## 未发布
 
+* **修复：换档时两个列表之间那块内容不跟着动，原地突然消失又出现**。
+  单侧可见条目是锁在**屏幕**位置上的（`scrollOffset = viewportTop + 冻结的屏幕 y`），
+  而 `RenderSliverGrid` 上报的 `scrollExtent` / `paintExtent` 取的是"已布局条目里最靠下
+  那条的下边缘"。锁定坐标跟着滚动走，本段高度于是变成 `pixels - precede + 常数`；视口里
+  后面每个 sliver 的位置又都是前一个 extent 累加出来的 —— 本段之后的内容（两段之间的间隔、
+  下一段网格）就被摆到一个**屏幕常量**上：过渡期既不跟着插值移动，又在第一帧整体偏一截。
+  滚到上一段只剩半行、再放大（本段变矮）时必现。修法是把锁定条目的 sliver 坐标夹回本段的
+  内容范围 `[0, 内容末端 - 条目高度]`，让本段高度重新只取决于档位几何。
+  新增 `test/zoom_gap_motion_test.dart`（横屏 / 竖屏 / 第二段同向移动 3 例，未修复时横屏
+  第一帧就瞬移 66.8px、竖屏整段静止后在末帧跳 238px）。
 * **新增 `FolderZoomSectionHost` / `FolderZoomMetricsScope`**：让同一份列表组件既能单独成页，
   也能作为多段页面里的一段，不必再给它加一个可选 `metrics` 参数。
   [FolderZoomSliverBuilder] 现在会把当前帧的 [FolderZoomLayoutMetrics] 放进

@@ -692,6 +692,12 @@ class FolderZoomViewportTracker {
     _section(section).contentCount = count;
   }
 
+  /// 某一段上一次回填的条目总数；还没回填过时返回 `null`。
+  ///
+  /// 布局侧要用它把「锁在屏幕上的单侧可见条目」夹回本段的内容范围
+  /// （见 `_SliverAnimatedZoomGridLayout._clampPinned`）。
+  int? contentCountOf(Object? section) => _sections[section]?.contentCount;
+
   int get anchorIndex => _defaultSection?.anchorIndex ?? 0;
   double get anchorRatio => _defaultSection?.anchorRatio ?? 0.0;
   double get anchorFocusY => _defaultSection?.anchorFocusY ?? 0.0;
@@ -3442,7 +3448,10 @@ class _SliverAnimatedZoomGridLayout extends SliverGridLayout {
         if (info.kind == FolderZoomItemPin.fadeOut) {
           final geometry = _geometryIn(info.layer, index);
           return SliverGridGeometry(
-            scrollOffset: viewportTop + info.top,
+            scrollOffset: _clampPinned(
+              viewportTop + info.top,
+              geometry.mainAxisExtent,
+            ),
             crossAxisOffset: geometry.crossAxisOffset,
             mainAxisExtent: geometry.mainAxisExtent,
             crossAxisExtent: geometry.crossAxisExtent,
@@ -3459,7 +3468,7 @@ class _SliverAnimatedZoomGridLayout extends SliverGridLayout {
                 targetTop;
         final geometry = _geometryIn(targetLayer, index);
         return SliverGridGeometry(
-          scrollOffset: viewportTop + top,
+          scrollOffset: _clampPinned(viewportTop + top, geometry.mainAxisExtent),
           crossAxisOffset: geometry.crossAxisOffset,
           mainAxisExtent: geometry.mainAxisExtent,
           crossAxisExtent: geometry.crossAxisExtent,
@@ -3498,6 +3507,44 @@ class _SliverAnimatedZoomGridLayout extends SliverGridLayout {
       mainAxisExtent: mainAxisExtent * inverse,
       crossAxisExtent: crossAxisExtent * inverse,
     );
+  }
+
+  /// 把锁定条目的 sliver 坐标夹进本段的内容范围 `[0, 内容末端 - 条目高度]`。
+  ///
+  /// 单侧可见条目是锁在**屏幕**位置上的：`scrollOffset = viewportTop + 冻结的屏幕 y`。
+  /// 这在屏幕上正是想要的（原地淡入淡出），但它是一个**跟着滚动位置走**的坐标：
+  ///
+  /// ```text
+  /// 本段上报的高度 = 已布局条目里最靠下的那条的下边缘
+  ///                = viewportTop + (冻结屏幕 y + 条目高度)
+  ///                = (pixels - precede) + 常数
+  /// ```
+  ///
+  /// `RenderSliverGrid` 正是这样取 `scrollExtent` / `paintExtent` 的（`reachedEnd`
+  /// 时直接取 `trailingScrollOffset`），而视口里**后面每一个 sliver 的位置都是
+  /// 前一个的 extent 累加出来的**（`layoutOffset += layoutExtent`）。于是本段之后
+  /// 的内容——两段之间那行固定高的介绍、下一段网格——会被摆到一个"屏幕常量"的
+  /// 位置上：换档过程中它们既不跟着插值移动，又在第一帧整体偏移一截，看起来就是
+  /// "间隔那块组件位移动画消失，原地突然消失又出现"。
+  ///
+  /// 触发条件是本段**变矮**（列表→网格）且末尾几行有单侧可见条目：淡入条目锁在
+  /// 目标档的屏幕位置上、高度也是目标档的（更矮的插值末端压不住它），它就成了
+  /// 那条"最靠下的条目"。滚到上一段只剩半行的位置时最容易撞上。
+  ///
+  /// 夹回内容范围之后，最靠下的条目最多就是插值末端本身，本段报出去的高度重新
+  /// 只取决于档位几何、与滚动位置无关；被挤出去的那点位移通常只有几十像素，且只
+  /// 发生在正在淡入 / 淡出的条目上（不可见或正在消失）。
+  double _clampPinned(double offset, double extent) {
+    final int? count = tracker?.contentCountOf(section);
+    if (count == null || count <= 0) return offset;
+    double end = 0.0;
+    for (final layer in layers) {
+      end += _maxScrollOffsetIn(layer, count) * layer.weight;
+    }
+    final double maxOffset = math.max(0.0, end - extent);
+    // 上界：不能越过内容末端；下界：不能高于内容起点（否则 `paintExtent` 的
+    // `from` 会被拉到负值，同样把高度算多）。
+    return offset.clamp(0.0, maxOffset);
   }
 
   static double mainStrideFor({
