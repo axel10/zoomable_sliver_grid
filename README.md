@@ -167,3 +167,69 @@ knowing:
   to "keep the grid's first item where it is" and never yanks the page down.
 - Bottom edge detection / clamping is exact with a header in place, because
   `maxScrollOffsetFor` is computed from the real viewport height rather than from the paint extent.
+
+## Several grids in one page
+
+A page can carry more than one zoomable grid — a folder list, a fixed-height intro row, then a file
+list, for example. They share one `FolderZoomSliverBuilder` (column count and font sizes depend only
+on width + tier, so they are identical by construction) and each one declares its own identity:
+
+```dart
+FolderZoomSliverBuilder(
+  zoomScale: zoom,
+  width: constraints.maxWidth,
+  controller: controller,
+  builder: (context, metrics) => CustomScrollView(
+    controller: controller,
+    slivers: [
+      section('folders', metrics, folders.length),
+      SliverToBoxAdapter(child: IntroCard()),           // 高度固定，不参与缩放
+      section('files', metrics, files.length),
+    ],
+  ),
+)
+
+SliverGrid section(String id, FolderZoomLayoutMetrics metrics, int count) {
+  return SliverGrid(
+    gridDelegate: SliverAnimatedZoomGridDelegate(metrics: metrics, section: id),
+    delegate: SliverChildBuilderDelegate(
+      (context, index) => ZoomItemScaffold(
+        metrics: metrics,
+        section: id,                                     // 与 delegate 保持一致
+        titleText: 'Item $index',
+      ),
+      childCount: count,
+    ),
+  );
+}
+```
+
+Both `section` values must be distinct, and the same value must be passed to `ZoomItemScaffold` —
+each section numbers its items from `0`, so the fade-in/fade-out classification has to be looked up
+per section.
+
+The scroll solve moves to **page coordinates**:
+
+```text
+gapBefore_k   = precede_k - Σ_{j<k} extent_j          // 不随档位变化的那部分（页头 / 介绍行 / padding）
+pageStart_k   = gapBefore_k + Σ_{j<k} extent_j(L)
+targetPixels  = pageStart_anchor(L) + localTargetTop(L)     // 焦点锚定
+              = pageEnd(L) + tail - viewportHeight          // 贴底
+              = pixels                                      // 贴顶
+```
+
+`Σ_{j<k} extent_j(L)` is the whole point: when the folder list shrinks from 1120px to 412px, the file
+list below it moves up by 708px in page space. Without that term the scroll compensation keeps the
+focused item fixed *inside its own section* while the section itself slides — the visible symptom is
+"the lower list jumps by one section-height the moment the tier changes". Gaps between sections are
+zoom-invariant, which is what lets `gapBefore` be measured once and reused across tiers.
+
+Notes:
+
+- Only one section can be the anchor (the one under the focus). Everything below it still moves; that
+  is unavoidable and exactly what keeps both lists' content continuous.
+- A section is pruned from the tracker after two layout passes without visiting it, so conditionally
+  removing a list does not leave a stale extent behind.
+- During the transition a section's own items morph in its own coordinate frame, so the two lists
+  animate on the same clock with no cross-talk.
+

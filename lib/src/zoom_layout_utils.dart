@@ -2,6 +2,7 @@ import 'dart:math' as math;
 import 'dart:ui' show lerpDouble;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flutter/rendering.dart';
 import 'zoom_debug.dart';
 import 'zoom_pinch.dart';
@@ -493,8 +494,68 @@ const double kFolderZoomVisibilityEpsilon = 1.0;
 /// 焦点默认高度（占视口高度的比例）：`0.5` 即视口中心。
 const double kFolderZoomFocusCenter = 0.5;
 
+/// 一个网格段连续多少帧没被布局到，才认为它已经从页面里移除。
+///
+/// 只留 1 帧宽限：段被移除后它的 `precede` / 条目数会污染下游段的位置换算，
+/// 拖得越久越容易在换档时被算进去。而"某一帧恰好没布局到"在正常滚动里几乎
+/// 不会发生（视口会按顺序布局每一个子 sliver）。
+const int kSectionFrameGrace = 2;
+
 /// 焦点锚相对内容两端的位置。
 enum _ZoomAnchorEdge { none, top, bottom }
+
+/// 页面里**一个参与缩放的网格段**的状态。
+///
+/// 一个 [FolderZoomSliverBuilder] 下可以挂多个网格（`SliverAnimatedZoomGridDelegate`
+/// 的 `section` 区分），它们共用同一套几何（列数 / 字号只取决于宽度和档位），
+/// 但各自的条目数、以及在页面里的起始位置都不同。
+///
+/// 关键是把每段的坐标记全：`precede` 是本段起始边在**页面坐标**里的位置，
+/// `gapBefore` 是它之前那段不参与缩放的内容（页头 / 外层 padding / 中间那行介绍）。
+/// 后者由 `precede - Σ(上游各段高度)` 反推，因为上游各段高度随档位变、两者相减
+/// 正好剩下固定部分 —— 于是跨档求解时下游网格能被正确地整体挪回来。
+class _ZoomSectionState {
+  _ZoomSectionState(this.id);
+
+  final Object? id;
+
+  double usableWidth = 0.0;
+  double outerWidth = 0.0;
+
+  /// 视口顶端在**本段局部坐标**里的位置（`pixels - precede`，起始边在视口下方时为负）。
+  double viewportTop = 0.0;
+  double remainingPaintExtent = 0.0;
+
+  double listMainAxisSpacing = kFolderListRowSpacing;
+  double gridCrossAxisSpacing = kGridCrossAxisSpacing;
+  double gridMainAxisSpacing = kGridMainAxisSpacing;
+
+  /// 本段条目总数（由 `computeMaxScrollOffset` 回填）。
+  int? contentCount;
+
+  /// 本段起始边在页面坐标里的位置（每次布局刷新）。
+  double precede = 0.0;
+
+  /// 本段之前**不参与缩放**的内容高度（页头、外层 padding、中间那行介绍）。
+  double gapBefore = 0.0;
+
+  /// [gapBefore] 是否已经量出来过。
+  ///
+  /// 首帧各段的条目数还没回填，反推不出上游高度；此时所有跨段换算都退回
+  /// "本段局部坐标"，也就是不补偿 —— 与"还没有任何几何变化"的真实状态一致。
+  bool gapReady = false;
+
+  /// 锚点落在本段时才有意义。
+  int anchorIndex = 0;
+  double anchorRatio = 0.0;
+  double anchorFocusY = 0.0;
+  bool hasAnchor = false;
+
+  bool hasMeasurement = false;
+
+  /// 最近一次被布局到的帧序号；用来淘汰已经从页面里移除的段。
+  int frameIndex = 0;
+}
 
 /// 记录 Sliver 最近一次视口范围与**焦点锚**，供档位过渡期间换算滚动距离、
 /// 并判定条目在起止档位的可见性。
@@ -514,119 +575,325 @@ enum _ZoomAnchorEdge { none, top, bottom }
 /// 与"顶部条目锚定"只差 `r * (strideB - strideA)` —— 所有锚定策略的差别都收敛在焦点高度 `f` 上。
 /// 焦点默认取视口中心（捏合时取双指中点），靠近顶/底一屏内渐变到 `0` / 视口底，
 /// 于是两端自动退化成"顶部 / 底部对齐"，不会撞上滚动边界产生夹取跳变。
+///
+/// ## 多段（一页多个网格）
+///
+/// 上面那套算出来的 `targetTop` 是**本段局部坐标**。页面里还有别的网格时，下游网格
+/// 的起始边会随着上游网格一起上下移动，滚动补偿必须把这段位移算进去。所以这里统一
+/// 换成**页面坐标**（与 `ScrollPosition.pixels` 同一套）求解：
+///
+/// ```text
+/// pageStart(k, L) = gapBefore_k + Σ_{j<k} H_j(L)     // 第 k 段起始边在页面里的位置
+/// targetPixels(L) = pageStart(anchor, L) + targetTop(L)          // 焦点锚定
+///                 = pageEnd(L) + tail - viewportHeight           // 贴底
+///                 = pixels                                        // 贴顶
+/// viewportTop(k, L) = targetPixels(L) - pageStart(k, L)          // 给布局用的局部值
+/// ```
+///
+/// 只有一段时 `pageStart = gapBefore`（常量），公式退化成原来的
+/// `目标像素 = 常量 + targetTop`，行为完全不变。
 class FolderZoomViewportTracker {
-  double usableWidth = 0.0;
-  double outerWidth = 0.0;
+  /// 各段状态；单列表用法下只有键 `null` 一项。
+  final Map<Object?, _ZoomSectionState> _sections =
+      <Object?, _ZoomSectionState>{};
 
-  /// 视口顶端在 **sliver 坐标系**里的位置，每次布局都会刷新（不再冻结）。
-  ///
-  /// 等于 `pixels - precede`：列表上方还有 header / `SliverPadding` 时它是**负数**
-  /// （起始边还在视口顶端之下）。不要用 `constraints.scrollOffset` 代替 ——
-  /// 那个值被 Flutter 钳在 0，会把"列表起始边在视口下方"错当成"列表已贴顶"。
-  double viewportTop = 0.0;
-  double viewportBottom = 0.0;
-  double remainingPaintExtent = 0.0;
-  bool hasMeasurement = false;
-
-  /// 焦点锚所在条目的索引。
-  int anchorIndex = 0;
-
-  /// 焦点落在锚条目内部的相对位置（`0.0` 顶部 ~ `1.0` 底部）。
-  ///
-  /// 以**槽位步距**（条目高度 + 行间距）为分母而不是条目高度：焦点经常落在
-  /// 行与行之间的空隙里，用条目高度会把比例压到 `1.0` 并产生一行的偏移。
-  double anchorRatio = 0.0;
-
-  /// 焦点在视口中的 y 坐标（已按边界渐变过的实际值）。
-  double anchorFocusY = 0.0;
-
-  /// 锚是否贴在了内容的两端。贴边时直接按"顶 / 底对齐"换算，保证精确。
-  _ZoomAnchorEdge _anchorEdge = _ZoomAnchorEdge.none;
-
-  /// 贴边锚在**源档位**下的视口顶部偏移。
-  ///
-  /// 底部贴边时目标滚动位置不能靠"内容总高 − 视口高"来算（Sliver 的坐标里
-  /// 含有外层 padding，会差出几十像素），改用两端内容总高之差平移，padding 自动抵消。
-  double anchorSourceTop = 0.0;
-
-  bool hasAnchor = false;
-
-  /// 锚定假想的视口顶部与真实视口顶部的残差。
-  ///
-  /// 只有当滚动被 `maxScrollExtent` 夹住（长度变短、撞到底）时才会非零；
-  /// 把它加回每一层的视口顶部，可见性判断才不会和屏幕上看到的内容打架。
-  double correction = 0.0;
-
-  /// Sliver 的条目总数，用于换算各档位的最大滚动偏移（由 `computeMaxScrollOffset` 回填）。
-  int? contentCount;
+  /// 按页面位置排好序的段（首个在最上面）。
+  List<_ZoomSectionState> _ordered = const <_ZoomSectionState>[];
 
   /// 读取当前滚动像素值的回调，由 [FolderZoomSliverBuilder] 注入。
   ///
-  /// 布局回调里拿不到 [ScrollPosition]，但换档时要把"sliver 坐标"换算成"滚动像素"，
+  /// 布局回调里拿不到 [ScrollPosition]，但换档时要把"本地坐标"换算成"滚动像素"，
   /// 需要知道两者之间的固定差值（外层 padding / 前置 sliver 的高度）。这里记下每次
-  /// 布局时刻的像素值，换档时就能把"当前像素"还原成同一时刻的 sliver 顶部。
-  ///
-  /// 少了它，过渡动画进行中再次换档会拿"当前像素"去配"上一帧的视口顶部"，
-  /// 目标偏移被算高一整帧的量（实测触底连点两档会多算 290px，滚动越界后靠
-  /// 回弹模拟慢慢弹回来）。
+  /// 布局时刻的像素值，换档时就能把"当前像素"还原成同一时刻的段起始边。
   double Function()? scrollPixelsReader;
 
   /// 读取当前滚动位置上界的回调（`ScrollPosition.maxScrollExtent`）。
   ///
-  /// 用来算 [tailExtent]：真实可滚范围里，本 sliver 内容末端之后还有多长
-  /// （外层 `SliverPadding` 的尾部 padding、后面的其它 sliver）。`contentExtentIn()`
-  /// 只算条目本身，拿它当上界会让"内容比视口矮、页面却还能往下滚"的页面
-  /// （目录页底部避让浮动 Dock 的填充）在换档时被误夹。
+  /// 用来算 [tailExtent]：真实可滚范围里，最后一段内容末端之后还有多长
+  /// （外层 `SliverPadding` 的尾部 padding、后面的其它 sliver）。
   double? Function()? scrollMaxPixelsReader;
 
-  /// 本 sliver 的内容末端之后、仍然能继续滚动的那段长度（sliver 坐标）。
-  ///
-  /// 稳态下每次布局都会刷新：`真实上界 − (内容总高 − 视口高)`。
-  /// 负数一律归零（正常情况下不会出现，出现说明读到的是过期上界）。
-  double tailExtent = 0.0;
+  /// 当前是否竖屏；几何换算要用（各段一致，所以放在这里）。
+  bool isPortrait = false;
 
-  /// 最近一次布局时的滚动像素值。
-  double? pixelsAtLayout;
+  /// 帧序号与最近一次记录时的帧时间戳。
+  ///
+  /// 用系统帧标识（而不是"某个段出现两次"这类相对信号）来判"这一帧是否已经
+  /// 看过这个段"：同一个 sliver 在一帧里可能被布局多次（父级重建、双重 layout），
+  /// 而某个段也可能一帧只走一次，两者叠在一起会把"还在"的段误判成已移除。
+  /// 一旦误判，`gapBefore` 会被重算成 `precede` 本身（上游高度整段丢失），
+  /// 换档时下游列表被顶走上游那一段的高度，反复换档就会一路漂到页面底部。
+  int _frameIndex = 0;
+  int _lastFrameStamp = -1;
+
+  double _height = 0.0;
+  double? _pixelsAtLayout;
+
+  /// 锚点所在段。
+  Object? _anchorSectionId;
+
+  /// 锚是否贴在了内容的两端。贴边时直接按"顶 / 底对齐"换算，保证精确。
+  _ZoomAnchorEdge _anchorEdge = _ZoomAnchorEdge.none;
+
+  /// 锚定成立那一刻的滚动像素值（贴顶时它就是目标值）。
+  double anchorSourcePixels = 0.0;
 
   /// 最近一次稳态布局所在的档位层。
   FolderZoomGeometryLayer? steadyLayer;
 
-  /// 行间距：由 delegate 在每次布局时回填，保证 tracker 的换算与真实布局一致。
-  double listMainAxisSpacing = kFolderListRowSpacing;
-  double gridCrossAxisSpacing = kGridCrossAxisSpacing;
-  double gridMainAxisSpacing = kGridMainAxisSpacing;
+  /// 本 sliver 的内容末端之后、仍然能继续滚动的那段长度（页面坐标）。
+  double tailExtent = 0.0;
 
-  /// 视口高度。
-  double get viewportHeight => math.max(0.0, viewportBottom - viewportTop);
-
-  /// 该 sliver 之前的滚动内容长度（`pixels - viewportTop`，含外层 `SliverPadding`）。
+  /// 锚定假想的视口与真实视口的残差（页面坐标）。
   ///
-  /// 稳态下是常量；它把"滚动像素"和"sliver 坐标"联系起来：
-  /// `viewportTop = pixels - precede`。页面滚到最顶端时 `viewportTop == -precede`。
-  double precede = 0.0;
+  /// 只有当滚动被 `maxScrollExtent` 夹住（长度变短、撞到底）时才会非零；
+  /// 把它加回每一段的视口顶部，可见性判断才不会和屏幕上看到的内容打架。
+  double correction = 0.0;
 
-  /// 视口顶端在 sliver 坐标里的最小值（= 页面 `pixels == 0` 时的取值）。
-  ///
-  /// 列表上方还有 header 时它是**负的**：`viewportTop` 落在 `[minViewportTop, ...]`
-  /// 区间里都是合法的，夹取时不能按 0 截断，否则贴顶换档会把列表硬拽到页面最顶端。
+  bool hasAnchor = false;
+  bool hasMeasurement = false;
+
+  /// 过渡期是否处于"多几何层混合"状态；用于只在过渡结束那一帧打一次日志。
+  bool _wasMixing = false;
+
+  /// 上一次布局时 `pixels - scrollOffset` 的值；恒定才算对齐，变化就说明挑错了位置。
+  double? _lastPrecede;
+
+  // ---------------------------------------------------------------------------
+  // 兼容单段用法的读取接口（默认取锚所在段，没有锚时取第一段）
+  // ---------------------------------------------------------------------------
+
+  _ZoomSectionState? get _defaultSection {
+    final anchored = _sections[_anchorSectionId];
+    if (anchored != null) return anchored;
+    if (_ordered.isNotEmpty) return _ordered.first;
+    return _sections[null];
+  }
+
+  /// 视口高度（各段相同）。
+  double get viewportHeight => math.max(0.0, _height);
+
+  double get usableWidth => _defaultSection?.usableWidth ?? 0.0;
+  double get outerWidth => _defaultSection?.outerWidth ?? 0.0;
+  double get viewportTop => _defaultSection?.viewportTop ?? 0.0;
+  double get viewportBottom => viewportTop + viewportHeight;
+  double get remainingPaintExtent =>
+      _defaultSection?.remainingPaintExtent ?? 0.0;
+  double get precede => _defaultSection?.precede ?? 0.0;
+  int? get contentCount => _defaultSection?.contentCount;
+
+  set contentCount(int? value) {
+    if (value == null) return;
+    _section(null).contentCount = value;
+  }
+
+  /// 回填某一段的条目总数（由该段网格的 `computeMaxScrollOffset` 调用）。
+  void setContentCount(Object? section, int count) {
+    _section(section).contentCount = count;
+  }
+
+  int get anchorIndex => _defaultSection?.anchorIndex ?? 0;
+  double get anchorRatio => _defaultSection?.anchorRatio ?? 0.0;
+  double get anchorFocusY => _defaultSection?.anchorFocusY ?? 0.0;
+
+  /// 最近一次布局时的滚动像素值。
+  double? get pixelsAtLayout => _pixelsAtLayout;
+
+  /// 视口顶端在局部坐标里的最小值（= 页面 `pixels == 0` 时的取值）。
   double get minViewportTop => -precede;
 
   /// 页面是否已经滚到最顶端。
-  ///
-  /// 只有这时才真的没有"向上滚"的余量，锚定才该退化成顶对齐。用
-  /// `viewportTop <= 0.5` 判断是错的：列表起始边贴在视口顶端之下时它也是 0 或负数，
-  /// 但那恰恰是应该正常补偿滚动的场景。
   bool get atScrollStart {
-    final double? px = pixelsAtLayout;
+    final double? px = _pixelsAtLayout;
     if (px != null) return px <= 0.5;
     return viewportTop <= 0.5;
   }
 
-  /// 当前 Sliver 是否在视口中可见（用于多 Sliver 时仅激活可见 Sliver 的滚动吸附）。
-  bool get isActiveInViewport => hasMeasurement && remainingPaintExtent > 10.0;
+  /// 是否有任意一段在视口里可见（用于多段时仅激活可见段的滚动吸附）。
+  bool get isActiveInViewport {
+    for (final s in _ordered) {
+      if (s.hasMeasurement && s.remainingPaintExtent > 10.0) return true;
+    }
+    return false;
+  }
+
+  /// 参与布局的段 id（单列表时是 `[null]`）。
+  List<Object?> get sectionIds => _sections.keys.toList(growable: false);
 
   /// 调试用：当前锚定方式的名称（`top` / `bottom` / `none`）。
   String get anchorEdgeName => _anchorEdge.name;
+
+  // ---------------------------------------------------------------------------
+  // 段管理
+  // ---------------------------------------------------------------------------
+
+  _ZoomSectionState _section(Object? id) =>
+      _sections.putIfAbsent(id, () => _ZoomSectionState(id));
+
+  _ZoomSectionState _sectionOf(Object? id) =>
+      _sections[id] ?? _ZoomSectionState(id);
+
+  /// 进入/保持在当前帧，并淘汰已经连续若干帧没被布局到的段。
+  ///
+  /// 帧标识取 `SchedulerBinding.currentFrameTimeStamp`：同一帧内所有布局回调看到
+  /// 的值相同，跨帧递增，而且与 build 次数无关 —— 这正是"这一帧有没有看过某个段"
+  /// 需要的信息。宽限 [kSectionFrameGrace] 帧：某一段偶尔一帧没被布局（缓存范围外）
+  /// 不该让它连同条目数一起被丢掉，否则上游补偿会静默失效。
+  void _beginFrame() {
+    final int stamp =
+        SchedulerBinding.instance.currentFrameTimeStamp.inMicroseconds;
+    if (stamp == _lastFrameStamp) return;
+    _lastFrameStamp = stamp;
+    _frameIndex++;
+    final int keepFrom = _frameIndex - kSectionFrameGrace;
+    if (keepFrom <= 0) return;
+    final int before = _sections.length;
+    _sections.removeWhere((key, value) => value.frameIndex < keepFrom);
+    if (_sections.length == before) return;
+    _reorder();
+    if (_anchorSectionId != null && !_sections.containsKey(_anchorSectionId)) {
+      _anchorSectionId = null;
+      hasAnchor = false;
+    }
+  }
+
+  void _reorder() {
+    final list = <_ZoomSectionState>[
+      for (final s in _sections.values)
+        if (s.hasMeasurement) s,
+    ]..sort((a, b) => a.precede.compareTo(b.precede));
+    _ordered = list;
+  }
+
+  // ---------------------------------------------------------------------------
+  // 几何换算（全部按段取参数）
+  // ---------------------------------------------------------------------------
+
+  SliverGridGeometry _geomIn(
+    _ZoomSectionState s,
+    FolderZoomGeometryLayer layer,
+    int index,
+  ) {
+    return _SliverAnimatedZoomGridLayout.geometryInLayer(
+      layer: layer,
+      index: index,
+      usableWidth: s.usableWidth,
+      outerWidth: s.outerWidth,
+      isPortrait: isPortrait,
+      listMainAxisSpacing: s.listMainAxisSpacing,
+      gridCrossAxisSpacing: s.gridCrossAxisSpacing,
+      gridMainAxisSpacing: s.gridMainAxisSpacing,
+    );
+  }
+
+  double _strideIn(_ZoomSectionState s, FolderZoomGeometryLayer layer) {
+    return _SliverAnimatedZoomGridLayout.mainStrideFor(
+      layer: layer,
+      usableWidth: s.usableWidth,
+      outerWidth: s.outerWidth,
+      isPortrait: isPortrait,
+      listMainAxisSpacing: s.listMainAxisSpacing,
+      gridCrossAxisSpacing: s.gridCrossAxisSpacing,
+      gridMainAxisSpacing: s.gridMainAxisSpacing,
+    );
+  }
+
+  /// 本段在 [layer] 档位下的内容高度。
+  double _extentIn(_ZoomSectionState s, FolderZoomGeometryLayer layer) {
+    final int count = s.contentCount ?? 0;
+    if (count <= 0) return 0.0;
+    return _SliverAnimatedZoomGridLayout.contentExtentIn(
+      layer: layer,
+      childCount: count,
+      usableWidth: s.usableWidth,
+      outerWidth: s.outerWidth,
+      isPortrait: isPortrait,
+      listMainAxisSpacing: s.listMainAxisSpacing,
+      gridCrossAxisSpacing: s.gridCrossAxisSpacing,
+      gridMainAxisSpacing: s.gridMainAxisSpacing,
+    );
+  }
+
+  /// 本段在**混合几何**（过渡期）下的内容高度。
+  double _mixedExtent(
+    _ZoomSectionState s,
+    List<FolderZoomGeometryLayer> layers,
+  ) {
+    if (layers.isEmpty) return 0.0;
+    double sum = 0.0;
+    double weight = 0.0;
+    for (final layer in layers) {
+      sum += _extentIn(s, layer) * layer.weight;
+      weight += layer.weight;
+    }
+    if (weight <= 1e-6) return 0.0;
+    return sum / weight;
+  }
+
+  /// 本段起始边在页面坐标里的位置（按 [layer] 档位）。
+  double _pageStartIn(_ZoomSectionState s, FolderZoomGeometryLayer layer) {
+    double start = s.gapBefore;
+    for (final other in _ordered) {
+      if (identical(other, s)) break;
+      start += _extentIn(other, layer);
+    }
+    return start;
+  }
+
+  double _pageStartMixed(
+    _ZoomSectionState s,
+    List<FolderZoomGeometryLayer> layers,
+  ) {
+    double start = s.gapBefore;
+    for (final other in _ordered) {
+      if (identical(other, s)) break;
+      start += _mixedExtent(other, layers);
+    }
+    return start;
+  }
+
+  /// 整页可缩放内容的末端（页面坐标）。
+  double _pageEndIn(FolderZoomGeometryLayer layer) {
+    if (_ordered.isEmpty) return 0.0;
+    final last = _ordered.last;
+    return _pageStartIn(last, layer) + _extentIn(last, layer);
+  }
+
+  double _pageEndMixed(List<FolderZoomGeometryLayer> layers) {
+    if (_ordered.isEmpty) return 0.0;
+    final last = _ordered.last;
+    return _pageStartMixed(last, layers) + _mixedExtent(last, layers);
+  }
+
+  /// [layer] 档位下页面允许滚到的最大值（贴底时视口顶端的页面坐标）。
+  double maxPagePixelsFor(FolderZoomGeometryLayer layer) =>
+      _pageEndIn(layer) + tailExtent - viewportHeight;
+
+  /// [layer] 档位下本段视口顶端允许的最大值（局部坐标）。
+  double? maxViewportTopFor(
+    FolderZoomGeometryLayer layer, {
+    Object? section,
+    bool isPortrait = false,
+  }) {
+    if (_ordered.isEmpty) return null;
+    final s = _sectionOf(section);
+    if (s.contentCount == null) return null;
+    return maxPagePixelsFor(layer) - _pageStartIn(s, layer);
+  }
+
+  /// [layer] 档位在条目总数固定时的最大滚动偏移（页面坐标）。
+  double? maxScrollOffsetFor(
+    FolderZoomGeometryLayer layer, {
+    bool isPortrait = false,
+  }) {
+    if (_ordered.isEmpty) return null;
+    if (_ordered.every((s) => (s.contentCount ?? 0) <= 0)) return null;
+    return math.max(0.0, maxPagePixelsFor(layer));
+  }
+
+  // ---------------------------------------------------------------------------
+  // 布局回填
+  // ---------------------------------------------------------------------------
 
   void record({
     required double usableWidth,
@@ -641,58 +908,63 @@ class FolderZoomViewportTracker {
     double listMainAxisSpacing = kFolderListRowSpacing,
     double gridCrossAxisSpacing = kGridCrossAxisSpacing,
     double gridMainAxisSpacing = kGridMainAxisSpacing,
+    Object? section,
   }) {
-    final bool sizeChanged =
-        !hasMeasurement || (this.outerWidth - outerWidth).abs() > 1.0;
+    // 先推进帧号、淘汰旧段，再取本段：新建的段 `frameIndex` 还是 0，若在淘汰之后
+    // 才创建就不会被自己这一轮的清理顺手删掉（删掉的代价是条目数一起丢掉）。
+    _beginFrame();
+    final s = _section(section);
+    s.frameIndex = _frameIndex;
+    s.usableWidth = usableWidth;
+    s.outerWidth = outerWidth;
+    s.viewportTop = viewportTop;
+    s.remainingPaintExtent = remainingPaintExtent;
+    s.listMainAxisSpacing = listMainAxisSpacing;
+    s.gridCrossAxisSpacing = gridCrossAxisSpacing;
+    s.gridMainAxisSpacing = gridMainAxisSpacing;
+    s.hasMeasurement = true;
+    hasMeasurement = true;
 
-    this.usableWidth = usableWidth;
-    this.outerWidth = outerWidth;
-    this.viewportTop = viewportTop;
-    this.viewportBottom = viewportBottom;
-    this.remainingPaintExtent = remainingPaintExtent;
-    pixelsAtLayout = scrollPixelsReader?.call() ?? pixelsAtLayout;
+    this.isPortrait = isPortrait;
+    _height = math.max(0.0, viewportBottom - viewportTop);
 
-    // 不变量：`viewportTop` 与 `position.pixels` 之间只差一个**常量**
-    // —— 该 sliver 之前的滚动内容长度（`SliverPadding` 的 16px、上方的 header 高度…）。
-    // 这个差值一旦变化，说明拿到的 ScrollPosition 根本不是布局本 sliver 的那个，
-    // 后面所有"sliver 坐标 → 滚动像素"的换算都会崩（换档时会看到列表大幅上下移动）。
-    final double? px = pixelsAtLayout;
+    final double? px = scrollPixelsReader?.call();
     if (px != null) {
-      final double precede = math.max(0.0, px - viewportTop);
-      this.precede = precede;
-      if (_lastPrecede == null || (precede - _lastPrecede!).abs() > 1.0) {
+      _pixelsAtLayout = px;
+      s.precede = math.max(0.0, px - viewportTop);
+    }
+
+    _reorder();
+    _refreshGapBefore(layers);
+
+    final double? layoutPixels = _pixelsAtLayout;
+    if (layoutPixels != null && _sections.length == 1) {
+      final double? last = _lastPrecede;
+      if (last == null || (s.precede - last).abs() > 1.0) {
         zoomLog('align', () {
-          return 'top=${zd(viewportTop)} px=${zd(px)} '
-              'precede=${zd(precede)} '
-              'delta=${_lastPrecede == null ? '-' : zd(precede - _lastPrecede!)} '
+          return 'top=${zd(viewportTop)} px=${zd(layoutPixels)} '
+              'precede=${zd(s.precede)} '
+              'delta=${last == null ? '-' : zd(s.precede - last)} '
               'layers=${layers.length}';
         });
-        _lastPrecede = precede;
+        _lastPrecede = s.precede;
       }
     }
-    this.listMainAxisSpacing = listMainAxisSpacing;
-    this.gridCrossAxisSpacing = gridCrossAxisSpacing;
-    this.gridMainAxisSpacing = gridMainAxisSpacing;
-    hasMeasurement = true;
-    if (sizeChanged) hasAnchor = false;
 
     if (!isAnimating && layers.length == 1) {
       steadyLayer = layers.first;
-      _recordAnchor(
-        layers.first,
-        focusFraction: focusFraction,
-        isPortrait: isPortrait,
-      );
-      _refreshTailExtent(layers.first, isPortrait: isPortrait);
+      _recomputeAnchor(focusFraction, isPortrait);
+      _refreshTailExtent(layers);
       correction = 0.0;
       if (_wasMixing) {
         _wasMixing = false;
         zoomLog('layout', () {
-          return 'settle top=${zd(viewportTop)} px=${zd(pixelsAtLayout)} '
+          return 'settle top=${zd(viewportTop)} px=${zd(layoutPixels)} '
               'anchor=${_anchorEdge.name}#$anchorIndex r=${zd(anchorRatio, 3)} '
               'f=${zd(anchorFocusY)} layer=${_layerTag(layers.first)} '
               'tail=${zd(tailExtent)} '
-              'max=${zd(maxViewportTopFor(layers.first, isPortrait: isPortrait))}';
+              'sections=${_ordered.length} '
+              'pageMax=${zd(maxPagePixelsFor(layers.first))}';
         });
       }
       return;
@@ -701,66 +973,98 @@ class FolderZoomViewportTracker {
 
     if (!hasAnchor || layers.isEmpty) return;
 
-    // 过渡期保留锚，只把"假想视口"与真实视口的残差算出来。
+    // 过渡期保留锚，只把"假想视口"与真实视口的残差算出来（页面坐标）。
     double assumed = 0.0;
     double weight = 0.0;
     for (final layer in layers) {
-      assumed += _anchorTopIn(layer, isPortrait: isPortrait) * layer.weight;
+      final double? target = targetPixelsForLayer(layer);
+      if (target == null) continue;
+      assumed += target * layer.weight;
       weight += layer.weight;
     }
-    if (weight > 1e-6) {
-      correction = viewportTop - assumed / weight;
+    if (weight > 1e-6 && layoutPixels != null) {
+      correction = layoutPixels - assumed / weight;
     }
     zoomLog('layout', () {
-      double mixExtent = 0.0;
-      for (final layer in layers) {
-        mixExtent += _contentExtentOf(layer, isPortrait: isPortrait) * layer.weight;
-      }
-      return 'mix top=${zd(viewportTop)} px=${zd(pixelsAtLayout)} '
+      return 'mix top=${zd(viewportTop)} px=${zd(layoutPixels)} '
           'assumed=${weight > 1e-6 ? zd(assumed / weight) : 'n/a'} '
           'corr=${zd(correction)} anchor=${_anchorEdge.name}#$anchorIndex '
           'r=${zd(anchorRatio, 3)} f=${zd(anchorFocusY)} '
           'vh=${zd(viewportHeight)} '
-          'maxMix=${zd(math.max(0.0, mixExtent - viewportHeight))} '
+          'maxMix=${zd(maxPagePixelsFor(layers.last))} '
+          'sections=${_ordered.length} '
           'layers=${layers.map(_layerTag).join(',')}';
     });
   }
 
-  /// 过渡期是否处于"多几何层混合"状态；用于只在过渡结束那一帧打一次日志。
-  bool _wasMixing = false;
-
-  /// 上一次布局时 `pixels - scrollOffset` 的值；恒定才算对齐，变化就说明挑错了位置。
-  double? _lastPrecede;
-
-  /// 几何层的简短标记，例如 `lx1/w1.00/e74.0`、`gx4/w0.00/th0.0`。
-  static String _layerTag(FolderZoomGeometryLayer layer) {
-    final head = '${layer.isGrid ? 'g' : 'l'}x${layer.crossAxisCount}'
-        '/w${layer.weight.toStringAsFixed(2)}';
-    return layer.isGrid
-        ? '$head/th${layer.gridTextHeight.toStringAsFixed(1)}'
-        : '$head/e${layer.listExtent.toStringAsFixed(1)}';
+  /// 用上游各段的当前高度反推本段之前的固定内容高度。
+  ///
+  /// 只在**稳态**（单层几何）下刷新：过渡期各段高度是插值出来的，`precede` 减掉
+  /// 的却是混合高度，算出来的差值既不是这一档也不是那一档的值。它本来是个与档位
+  /// 无关的常量，用插值反推只会把它带偏，而下游每一次 `pageStart` 都依赖它。
+  void _refreshGapBefore(List<FolderZoomGeometryLayer> layers) {
+    if (layers.length != 1) return;
+    for (final s in _ordered) {
+      if (!s.hasMeasurement) continue;
+      double upstream = 0.0;
+      bool ready = true;
+      for (final other in _ordered) {
+        if (identical(other, s)) break;
+        if (other.contentCount == null) ready = false;
+        upstream += _mixedExtent(other, layers);
+      }
+      if (!ready) continue;
+      s.gapBefore = s.precede - upstream;
+      s.gapReady = true;
+    }
   }
+
+  /// 稳态下刷新 [tailExtent]：真实可滚上界与最后一段内容末端之间还差多少。
+  ///
+  /// 只在单层稳态调用 —— 那时 `precede` 与各段高度都是确定的，而过渡期的内容总高
+  /// 每帧在变，算出来的 tail 只会是中间值。
+  void _refreshTailExtent(List<FolderZoomGeometryLayer> layers) {
+    final double? maxPixels = scrollMaxPixelsReader?.call();
+    if (maxPixels == null || _ordered.isEmpty) return;
+    if (_pixelsAtLayout == null) return;
+    if (viewportHeight <= 1.0) return;
+    final double end = _pageEndMixed(layers);
+    final double tail = maxPixels + viewportHeight - end;
+    // 只信任正向余量：读到过期上界（上一帧的内容长度）时会算出负数，保留旧值。
+    if (tail >= -0.5) tailExtent = math.max(0.0, tail);
+  }
+
+  // ---------------------------------------------------------------------------
+  // 锚点
+  // ---------------------------------------------------------------------------
 
   /// 用新的焦点高度重新计算锚点（捏合开始时按手指位置重新取锚）。
   void refreshAnchor({
     double focusFraction = kFolderZoomFocusCenter,
     bool isPortrait = false,
   }) {
-    final layer = steadyLayer;
-    if (layer == null || !hasMeasurement) return;
-    _recordAnchor(layer, focusFraction: focusFraction, isPortrait: isPortrait);
+    if (steadyLayer == null || !hasMeasurement) return;
+    this.isPortrait = isPortrait;
+    _recomputeAnchor(focusFraction, isPortrait);
   }
 
-  void _recordAnchor(
-    FolderZoomGeometryLayer layer, {
-    required double focusFraction,
-    required bool isPortrait,
-  }) {
-    final double height = viewportHeight;
-    if (height <= 1.0) return;
+  void _setAnchorSection(_ZoomAnchorEdge edge, _ZoomSectionState? s) {
+    _anchorEdge = edge;
+    _anchorSectionId = s?.id;
+    for (final other in _sections.values) {
+      other.hasAnchor = identical(other, s);
+    }
+  }
 
+  void _recomputeAnchor(double focusFraction, bool isPortrait) {
+    final layer = steadyLayer;
+    final height = viewportHeight;
+    if (layer == null || _ordered.isEmpty || height <= 1.0) return;
+    if (!hasMeasurement) return;
+
+    final double px = _pixelsAtLayout ?? 0.0;
     hasAnchor = true;
-    anchorSourceTop = viewportTop;
+    anchorSourcePixels = px;
 
     // 贴住两端时直接记成"顶 / 底对齐"，换算精确到像素，且不会因为
     // 焦点落在最后一条的槽位里而少滚一行。
@@ -768,69 +1072,97 @@ class FolderZoomViewportTracker {
     // 顶端的判据是"页面已经滚到最顶端"（再没有向上滚的余量），而不是
     // `viewportTop <= 0.5`：列表上方还有 header / padding 时，起始边贴在视口顶端
     // **之下**也会让 `viewportTop` 等于 0 或负数，那种情况恰恰要正常按焦点补偿滚动。
-    if (atScrollStart) {
-      _anchorEdge = _ZoomAnchorEdge.top;
-      anchorIndex = 0;
-      anchorRatio = 0.0;
-      anchorFocusY = 0.0;
+    if (px <= 0.5) {
+      final first = _ordered.first;
+      _setAnchorSection(_ZoomAnchorEdge.top, first);
+      first
+        ..anchorIndex = 0
+        ..anchorRatio = 0.0
+        ..anchorFocusY = 0.0;
       return;
     }
-    // 底端判据：**内容末端已经进了视口**（视口顶部越过了"内容总高 − 视口高"）。
+
+    // 底端判据：**最后一段的内容末端已经进了视口**。
     //
-    // 以前还要求 `maxOffset > 0.5`（内容必须比视口高），这个条件把最常见的目录页
-    // 挡在门外：文件夹少、底部还有一大块避让浮动 Dock 的 `SliverPadding` 时，
-    // 网格内容本身比视口矮（`contentExtent - viewportHeight` 是负数），但页面照样
-    // 能往下滚一百多像素。此时锚点落到 `none`，锚条目按"视口顶部还在内容里"去取，
-    // 取到的位置根本不在内容里；接着 `viewportTopForLayer()` 又把视口顶部夹回
-    // 内容范围 → 捏合第一帧整屏条目下掉一个 padding 的高度（实测 146px）。
-    //
-    // 内容比视口矮时 `contentMax` 是负数，"滚到它之上"同样成立，判据不需要额外的
+    // 内容比视口矮时 `pageMax` 是负数，"滚到它之上"同样成立，判据不需要额外的
     // 下限门槛。条目总数还没回填（首帧）时算不出内容总高，退回不判底。
-    final int? count = contentCount;
-    if (count != null && count > 0) {
-      final double contentMax =
-          _contentExtentOf(layer, isPortrait: isPortrait) - height;
-      if (viewportTop >= contentMax - 0.5) {
-        _anchorEdge = _ZoomAnchorEdge.bottom;
-        anchorIndex = 0;
-        anchorRatio = 1.0;
-        anchorFocusY = height;
+    final last = _ordered.last;
+    if ((last.contentCount ?? 0) > 0) {
+      final double lastLocalMax =
+          maxPagePixelsFor(layer) - _pageStartIn(last, layer);
+      // 同样从 `precede` 现场换算，不用 `last.viewportTop`（可能是上一帧留下的值）。
+      if (px - last.precede >= lastLocalMax - 0.5) {
+        _setAnchorSection(_ZoomAnchorEdge.bottom, last);
+        last
+          ..anchorIndex = 0
+          ..anchorRatio = 1.0
+          ..anchorFocusY = height;
         return;
       }
     }
 
-    _anchorEdge = _ZoomAnchorEdge.none;
+    // 焦点锚：先按"视口中心"找焦点落在哪一段，再用该段的局部坐标取锚条目。
+    final double preferred =
+        focusFraction.clamp(0.0, 1.0) * height;
+    final double probe = px + preferred;
+    _ZoomSectionState anchor = last;
+    for (final s in _ordered) {
+      final double start = _pageStartIn(s, layer);
+      if (probe < start + _extentIn(s, layer) - kFolderZoomVisibilityEpsilon) {
+        anchor = s;
+        break;
+      }
+    }
 
+    _setAnchorSection(_ZoomAnchorEdge.none, anchor);
+
+    // 本段视口顶端在段局部坐标里的位置。**不用** `anchor.viewportTop`：那是上一次
+    // 布局回填的值，而一帧里各段的布局先后不定（上游段先记录时，下游段的
+    // `viewportTop` 还是上一帧的），过渡刚结束那一帧它会带着混合几何的残值，
+    // 锚条目会因此错开一行。`precede` 是页面坐标、稳态下恒定，减去当前像素
+    // 就是同一时刻的局部值。
+    final double sectionTop = px - anchor.precede;
     double focus = _resolveFocusY(
       height,
       focusFraction,
       layer: layer,
-      isPortrait: isPortrait,
+      pageTop: px,
+      sectionTop: sectionTop,
     );
-    // 列表起始边还在视口顶端之下（上方有 header、页面刚打开）时，焦点**上方没有
+    // 本段起始边还在视口顶端之下（上方有 header、页面刚打开）时，焦点**上方没有
     // 内容**：把焦点压到第一条上，解出来的目标就等于"把起始边钉在原地"，
     // 不会把页面莫名往下滚一屏。
-    focus = math.max(focus, -viewportTop);
-    final double contentPoint = viewportTop + focus;
+    focus = math.max(focus, -sectionTop);
+    final double contentPoint = sectionTop + focus;
 
-    final int index = _SliverAnimatedZoomGridLayout.minChildIndexIn(
-      layer: layer,
-      scrollOffset: contentPoint,
-      usableWidth: usableWidth,
-      outerWidth: outerWidth,
-      isPortrait: isPortrait,
-      listMainAxisSpacing: listMainAxisSpacing,
-      gridCrossAxisSpacing: gridCrossAxisSpacing,
-      gridMainAxisSpacing: gridMainAxisSpacing,
-    );
-    final double stride = _strideOf(layer, isPortrait: isPortrait);
-    final geom = _geomIn(layer, index, isPortrait: isPortrait);
+    int index = _minIndexFor(anchor, layer, contentPoint);
+    final double stride = _strideIn(anchor, layer);
+    var geom = _geomIn(anchor, layer, index);
 
-    anchorIndex = index;
-    anchorRatio = stride <= 0.5
-        ? 0.0
-        : ((contentPoint - geom.scrollOffset) / stride).clamp(0.0, 1.0);
-    anchorFocusY = focus;
+    // 粘住上一次的锚条目。
+    //
+    // 同一**行**里的条目几何完全一样（`scrollOffset` 相同），用哪一个都能锚定，
+    // 但跨档时它们会落到不同的行：6 列下索引 40 在第 6 行，8 列下却在第 5 行。
+    // 若每次稳点都按"该行的第一个条目"重新取锚（40 -> 36），往回换档时锚就变成
+    // 了另一个条目，一来一回净丢一行 —— 反复换档就会缓慢地一路漂走。
+    // 只要上一次的锚条目还和焦点落在同一行，就继续用它，来回换档才能回到原位。
+    final int? sticky = anchor.hasAnchor ? anchor.anchorIndex : null;
+    if (sticky != null &&
+        sticky != index &&
+        sticky >= 0 &&
+        sticky < (anchor.contentCount ?? 0) &&
+        (_geomIn(anchor, layer, sticky).scrollOffset - geom.scrollOffset).abs() <
+            0.5) {
+      index = sticky;
+      geom = _geomIn(anchor, layer, index);
+    }
+
+    anchor
+      ..anchorIndex = index
+      ..anchorRatio = stride <= 0.5
+          ? 0.0
+          : ((contentPoint - geom.scrollOffset) / stride).clamp(0.0, 1.0)
+      ..anchorFocusY = focus;
   }
 
   /// 按"距顶 / 距底不足一屏"把焦点渐变到 `0` / `1`，让两端退化为顶 / 底对齐。
@@ -838,196 +1170,106 @@ class FolderZoomViewportTracker {
     double height,
     double focusFraction, {
     required FolderZoomGeometryLayer layer,
-    required bool isPortrait,
+    required double pageTop,
+    required double sectionTop,
   }) {
     final double preferred = focusFraction.clamp(0.0, 1.0) * height;
 
     // 距顶不足一屏时把焦点渐变到 `0`，让顶端退化成"顶对齐"、不撞滚动边界。
     //
-    // 但这个渐变只在**内容起始边已经被推到视口顶端之上**时才成立：上方还有
-    // header 时起始边在视口顶端之下（`viewportTop < 0`），向上余量是整个 header，
-    // 此时压焦点等于跳过补偿，用户看到的焦点内容会被整体甩走。这种情形交给
-    // `_recordAnchor` 里的 `focus = max(focus, -viewportTop)` 兜底：焦点落到内容
-    // 之外才退化成顶对齐，否则正常按焦点锚定。
-    final double topBlend = viewportTop < 0.0
+    // 判据分两层：
+    // - `sectionTop < 0`（本段起始边还在视口顶端**之下**，页头 / 前面还有内容）：
+    //   不渐变。此时焦点上方是本段之前的内容，"压到本段第一条"等于跳过补偿，
+    //   用户看到的焦点内容会被整体甩走；交给 `_recomputeAnchor` 里的
+    //   `focus = max(focus, -sectionTop)` 兜底。
+    // - 否则按"页面已经滚过多少**可缩放内容**"渐变（扣掉第一个网格段之前的页头）：
+    //   不能直接用段局部的偏移 —— 一页多段时第二段在中段时它的局部偏移可能
+    //   只有一两百（离"本段开头"很近），但页面其实滚出去好几千，按局部值渐变会
+    //   把焦点从视口中心一路压到本段顶部，也就是"焦点位置不对"。
+    final double leading =
+        pageTop - (_ordered.isEmpty ? 0.0 : _ordered.first.precede);
+    final double topBlend = sectionTop < 0.0
         ? 0.0
-        : (1.0 - viewportTop / height).clamp(0.0, 1.0);
+        : (1.0 - math.max(0.0, leading) / height).clamp(0.0, 1.0);
     double focus = lerpDouble(preferred, 0.0, topBlend)!;
 
-    final double? maxOffset = maxScrollOffsetFor(layer, isPortrait: isPortrait);
-    if (maxOffset != null && maxOffset > 1.0) {
+    // 底部渐变同理按**页面**还能不能滚来判：本段自己可能还能滚很久，但页面已经
+    // 到底了，此时任何档位都只能贴底，焦点必须退化成"底对齐"。
+    final double pageMax = maxPagePixelsFor(layer);
+    if (pageMax > 1.0) {
       final double bottomBlend =
-          (1.0 - (maxOffset - viewportTop) / height).clamp(0.0, 1.0);
+          (1.0 - (pageMax - pageTop) / height).clamp(0.0, 1.0);
       focus = lerpDouble(focus, height, bottomBlend)!;
     }
     return focus.clamp(0.0, height);
   }
 
-  SliverGridGeometry _geomIn(
-    FolderZoomGeometryLayer layer,
-    int index, {
-    required bool isPortrait,
-  }) {
-    return _SliverAnimatedZoomGridLayout.geometryInLayer(
-      layer: layer,
-      index: index,
-      usableWidth: usableWidth,
-      outerWidth: outerWidth,
-      isPortrait: isPortrait,
-      listMainAxisSpacing: listMainAxisSpacing,
-      gridCrossAxisSpacing: gridCrossAxisSpacing,
-      gridMainAxisSpacing: gridMainAxisSpacing,
-    );
-  }
+  // ---------------------------------------------------------------------------
+  // 求解：目标滚动像素
+  // ---------------------------------------------------------------------------
 
-  double _strideOf(FolderZoomGeometryLayer layer, {required bool isPortrait}) {
-    return _SliverAnimatedZoomGridLayout.mainStrideFor(
-      layer: layer,
-      usableWidth: usableWidth,
-      outerWidth: outerWidth,
-      isPortrait: isPortrait,
-      listMainAxisSpacing: listMainAxisSpacing,
-      gridCrossAxisSpacing: gridCrossAxisSpacing,
-      gridMainAxisSpacing: gridMainAxisSpacing,
-    );
-  }
-
-  double _contentExtentOf(
-    FolderZoomGeometryLayer layer, {
-    required bool isPortrait,
-  }) {
-    return _SliverAnimatedZoomGridLayout.contentExtentIn(
-      layer: layer,
-      childCount: contentCount ?? 0,
-      usableWidth: usableWidth,
-      outerWidth: outerWidth,
-      isPortrait: isPortrait,
-      listMainAxisSpacing: listMainAxisSpacing,
-      gridCrossAxisSpacing: gridCrossAxisSpacing,
-      gridMainAxisSpacing: gridMainAxisSpacing,
-    );
-  }
-
-  double _anchorTopIn(
-    FolderZoomGeometryLayer layer, {
-    required bool isPortrait,
-  }) {
+  /// [layer] 档位下，焦点锚对应的**滚动像素**（页面坐标）。
+  ///
+  /// 过渡动画直接把它当作目标滚动位置；单段时它等于"本段局部 targetTop"，
+  /// 多段时已经包含了上游各段高度变化带来的整体平移。
+  double? targetPixelsForLayer(FolderZoomGeometryLayer layer) {
+    if (!hasMeasurement || !hasAnchor) return null;
+    if (!(_sections[_anchorSectionId]?.gapReady ?? false)) return null;
     switch (_anchorEdge) {
       case _ZoomAnchorEdge.top:
-        // 页面已经在最顶端：目标就是"原地别动"，也就是把列表起始边钉在它此刻
-        // 所在的屏幕位置上。直接返回 0 是不对的 —— 上方还有 header / padding 时，
-        // 列表起始边的正确目标是个负数（`-precede` 起）。
-        return anchorSourceTop;
+        return anchorSourcePixels;
       case _ZoomAnchorEdge.bottom:
-        final source = steadyLayer;
-        if (source == null) return viewportTop;
-        return anchorSourceTop +
-            _contentExtentOf(layer, isPortrait: isPortrait) -
-            _contentExtentOf(source, isPortrait: isPortrait);
+        return maxPagePixelsFor(layer);
       case _ZoomAnchorEdge.none:
         break;
     }
-    final geom = _geomIn(layer, anchorIndex, isPortrait: isPortrait);
-    return geom.scrollOffset +
-        anchorRatio * _strideOf(layer, isPortrait: isPortrait) -
-        anchorFocusY;
+    final s = _sections[_anchorSectionId];
+    if (s == null || !s.hasAnchor) return null;
+    final geom = _geomIn(s, layer, s.anchorIndex);
+    final double top =
+        geom.scrollOffset + s.anchorRatio * _strideIn(s, layer) - s.anchorFocusY;
+    return _pageStartIn(s, layer) + top;
   }
 
-  /// 指定档位 [layer] 下锚定条目对应的视口顶部偏移（含过渡期残差修正，已夹取）。
+  /// [layer] 档位下，某一段视口顶端的**局部**偏移（含过渡期残差修正，已夹取）。
   double viewportTopForLayer(
     FolderZoomGeometryLayer layer, {
+    Object? section,
     bool isPortrait = false,
   }) {
-    if (!hasMeasurement || !hasAnchor) return viewportTop;
-    double top = _anchorTopIn(layer, isPortrait: isPortrait) + correction;
-    // 底部贴边时 `_anchorTopIn` 已由两端内容总高之差精确给出，不要再夹取。
+    final s = _sectionOf(section);
+    if (!hasMeasurement || !hasAnchor || !s.gapReady) return s.viewportTop;
+    final double? page = targetPixelsForLayer(layer);
+    if (page == null) return s.viewportTop;
+    double top = page + correction - _pageStartIn(s, layer);
+    // 底部贴边时 `targetPixelsForLayer` 已经精确给出贴底位置，不要再夹取。
     if (_anchorEdge != _ZoomAnchorEdge.bottom) {
-      final double? maxTop = maxViewportTopFor(layer, isPortrait: isPortrait);
-      if (maxTop != null) {
-        final double clamped = math.min(top, maxTop);
-        if ((clamped - top).abs() > 0.5) {
-          zoomLog('probe', () {
-            return 'layerTop clamped ${zd(top)} -> ${zd(clamped)} '
-                'maxTop=${zd(maxTop)} tail=${zd(tailExtent)} '
-                'layer=${_layerTag(layer)}';
-          });
-        }
-        top = clamped;
+      final double maxTop = maxPagePixelsFor(layer) - _pageStartIn(s, layer);
+      final double clamped = math.min(top, maxTop);
+      if ((clamped - top).abs() > 0.5) {
+        zoomLog('probe', () {
+          return 'layerTop clamped ${zd(top)} -> ${zd(clamped)} '
+              'maxTop=${zd(maxTop)} tail=${zd(tailExtent)} '
+              'layer=${_layerTag(layer)}';
+        });
       }
+      top = clamped;
     }
     // 下界是"页面滚到 0"对应的坐标，不是 0：上方还有 header / padding 时它是负的。
-    // 按 0 截断会把贴顶换档的目标算成"往上滚一整个 header 的高度"。
-    return math.max(minViewportTop, top);
+    return math.max(-s.precede, top);
   }
 
-  /// 稳态下刷新 [tailExtent]：真实可滚上界与本 sliver 内容末端之间还差多少。
-  ///
-  /// 只在单层稳态调用 —— 那时 `precede` 与 `contentExtent` 都是确定的，
-  /// 而过渡期的内容总高每帧在变，算出来的 tail 只会是中间值。
-  void _refreshTailExtent(
-    FolderZoomGeometryLayer layer, {
-    required bool isPortrait,
-  }) {
-    final double? maxPixels = scrollMaxPixelsReader?.call();
-    final int? count = contentCount;
-    if (maxPixels == null || count == null || count <= 0) return;
-    if (pixelsAtLayout == null) return;
-    if (viewportHeight <= 1.0) return;
-    final double maxTop = maxPixels - precede;
-    final double contentMax =
-        _contentExtentOf(layer, isPortrait: isPortrait) - viewportHeight;
-    final double tail = maxTop - contentMax;
-    // 只信任正向余量：读到过期上界（上一帧的内容长度）时会算出负数，保留旧值。
-    if (tail >= -0.5) tailExtent = math.max(0.0, tail);
-  }
-
-  /// [layer] 档位下视口顶部允许的最大值（= 内容末端贴到视口底 + 尾部余量）。
-  ///
-  /// 与 [maxScrollOffsetFor] 的差别只在那段 [tailExtent]：外层的尾部 padding
-  /// （目录页底部避让浮动 Dock 的填充）不属于本 sliver 的内容，但页面确实能滚
-  /// 到那里。拿不含它的上界去夹"假想视口顶"，会把整屏内容往上顶掉一个 padding。
-  double? maxViewportTopFor(
-    FolderZoomGeometryLayer layer, {
-    bool isPortrait = false,
-  }) {
-    final double? contentMax = maxScrollOffsetFor(
-      layer,
-      isPortrait: isPortrait,
-    );
-    if (contentMax == null) return null;
-    return contentMax + tailExtent;
-  }
-
-  /// 把焦点锚换算到 [layer] 档位的目标视口顶部偏移（不含残差修正、不夹取）。
-  ///
-  /// 过渡动画直接把它当作**目标**滚动位置，结束时的真实值再回填锚点。
+  /// 兼容旧名字：返回同一个页面坐标目标。
   double solveViewportTopFor(
     FolderZoomGeometryLayer layer, {
     bool isPortrait = false,
   }) {
-    if (!hasMeasurement || !hasAnchor) return viewportTop;
-    return _anchorTopIn(layer, isPortrait: isPortrait);
+    return targetPixelsForLayer(layer) ?? viewportTop;
   }
 
-  /// [layer] 档位在条目总数固定时的最大滚动偏移。
-  double? maxScrollOffsetFor(
-    FolderZoomGeometryLayer layer, {
-    bool isPortrait = false,
-  }) {
-    final int? count = contentCount;
-    if (count == null || count <= 0) return null;
-    final double extent = _SliverAnimatedZoomGridLayout.contentExtentIn(
-      layer: layer,
-      childCount: count,
-      usableWidth: usableWidth,
-      outerWidth: outerWidth,
-      isPortrait: isPortrait,
-      listMainAxisSpacing: listMainAxisSpacing,
-      gridCrossAxisSpacing: gridCrossAxisSpacing,
-      gridMainAxisSpacing: gridMainAxisSpacing,
-    );
-    return math.max(0.0, extent - viewportHeight);
-  }
+  // ---------------------------------------------------------------------------
+  // 单侧可见条目的冻结表（按段各一份）
+  // ---------------------------------------------------------------------------
 
   /// 过渡开始时**一次性**冻结"哪些条目原地淡入淡出、锁在哪个屏幕位置"。
   ///
@@ -1036,19 +1278,22 @@ class FolderZoomViewportTracker {
   /// 是本次过渡的终点。这样"锁在原位"的参照系始终是**上一帧真实画出来的位置**，
   /// 连点两档也不会让被锁定的条目瞬移 —— 已经锁定的条目由 [previous] 带过来。
   ///
-  /// 判定必须一次算完并冻结（原因见 [FolderZoomItemPinning] 的文档）。
+  /// 判定必须一次算完并冻结（原因见 [FolderZoomItemPinning] 的文档），并且**按段
+  /// 各算一份**：每段的条目索引都从 0 开始，混着用会让两段的条目互相顶替。
   FolderZoomItemPinning? buildPinning({
     required List<FolderZoomGeometryLayer> mixLayers,
     required FolderZoomGeometryLayer targetLayer,
     required double targetViewportTop,
     required bool isPortrait,
+    Object? section,
     FolderZoomItemPinning? previous,
     double previousProgress = 0.0,
   }) {
-    final int count = contentCount ?? 0;
+    final s = _sectionOf(section);
+    final int count = s.contentCount ?? 0;
     final double height = viewportHeight;
-    if (count <= 0 || !hasMeasurement || mixLayers.isEmpty) return null;
-    if (height <= 1.0) return null;
+    if (count <= 0 || !hasMeasurement) return null;
+    if (mixLayers.isEmpty || height <= 1.0) return null;
 
     double weightSum = 0.0;
     FolderZoomGeometryLayer? dominant;
@@ -1061,7 +1306,7 @@ class FolderZoomViewportTracker {
     // 各层在当前锚定下对应的屏幕视口顶部，与布局侧换算屏幕位置的口径完全一致。
     final List<double> mixTops = <double>[
       for (final layer in mixLayers)
-        viewportTopForLayer(layer, isPortrait: isPortrait),
+        viewportTopForLayer(layer, section: section, isPortrait: isPortrait),
     ];
 
     // 只为"可能出现在视口里"的条目做判定。可见范围必然落在各层
@@ -1073,31 +1318,21 @@ class FolderZoomViewportTracker {
       final layer = mixLayers[i];
       lo = math.min(
         lo,
-        _minIndexFor(layer, mixTops[i] - height, isPortrait: isPortrait) -
-            layer.crossAxisCount,
+        _minIndexFor(s, layer, mixTops[i] - height) - layer.crossAxisCount,
       );
       hi = math.max(
         hi,
-        _maxIndexFor(layer, mixTops[i] + height * 2, isPortrait: isPortrait) +
-            layer.crossAxisCount,
+        _maxIndexFor(s, layer, mixTops[i] + height * 2) + layer.crossAxisCount,
       );
     }
     lo = math.min(
       lo,
-      _minIndexFor(
-            targetLayer,
-            targetViewportTop - height,
-            isPortrait: isPortrait,
-          ) -
+      _minIndexFor(s, targetLayer, targetViewportTop - height) -
           targetLayer.crossAxisCount,
     );
     hi = math.max(
       hi,
-      _maxIndexFor(
-            targetLayer,
-            targetViewportTop + height * 2,
-            isPortrait: isPortrait,
-          ) +
+      _maxIndexFor(s, targetLayer, targetViewportTop + height * 2) +
           targetLayer.crossAxisCount,
     );
     lo = lo.clamp(0, count - 1);
@@ -1151,7 +1386,7 @@ class FolderZoomViewportTracker {
         double extent = 0.0;
         for (var i = 0; i < mixLayers.length; i++) {
           final layer = mixLayers[i];
-          final geometry = _geomIn(layer, index, isPortrait: isPortrait);
+          final geometry = _geomIn(s, layer, index);
           weight += layer.weight;
           top += (geometry.scrollOffset - mixTops[i]) * layer.weight;
           extent += geometry.mainAxisExtent * layer.weight;
@@ -1160,10 +1395,8 @@ class FolderZoomViewportTracker {
         top /= weight;
         extent /= weight;
 
-        final targetGeometry =
-            _geomIn(targetLayer, index, isPortrait: isPortrait);
-        final double targetTop =
-            targetGeometry.scrollOffset - targetViewportTop;
+        final targetGeometry = _geomIn(s, targetLayer, index);
+        final double targetTop = targetGeometry.scrollOffset - targetViewportTop;
 
         final bool visibleFrom = _isOnScreen(top, extent, height);
         final bool visibleTo =
@@ -1174,9 +1407,8 @@ class FolderZoomViewportTracker {
             : (visibleFrom
                 ? FolderZoomItemPin.fadeOut
                 : FolderZoomItemPin.fadeIn);
-        lockedLayer = kind == FolderZoomItemPin.fadeOut
-            ? dominant
-            : targetLayer;
+        lockedLayer =
+            kind == FolderZoomItemPin.fadeOut ? dominant : targetLayer;
         // 淡出锁在"现在的位置"，淡入锁在"将要落到的位置"。
         lockedTop = kind == FolderZoomItemPin.fadeOut ? top : targetTop;
         opacityFrom = kind == FolderZoomItemPin.fadeOut ? 1.0 : 0.0;
@@ -1210,37 +1442,46 @@ class FolderZoomViewportTracker {
   }
 
   int _minIndexFor(
+    _ZoomSectionState s,
     FolderZoomGeometryLayer layer,
-    double scrollOffset, {
-    required bool isPortrait,
-  }) {
+    double scrollOffset,
+  ) {
     return _SliverAnimatedZoomGridLayout.minChildIndexIn(
       layer: layer,
       scrollOffset: scrollOffset,
-      usableWidth: usableWidth,
-      outerWidth: outerWidth,
+      usableWidth: s.usableWidth,
+      outerWidth: s.outerWidth,
       isPortrait: isPortrait,
-      listMainAxisSpacing: listMainAxisSpacing,
-      gridCrossAxisSpacing: gridCrossAxisSpacing,
-      gridMainAxisSpacing: gridMainAxisSpacing,
+      listMainAxisSpacing: s.listMainAxisSpacing,
+      gridCrossAxisSpacing: s.gridCrossAxisSpacing,
+      gridMainAxisSpacing: s.gridMainAxisSpacing,
     );
   }
 
   int _maxIndexFor(
+    _ZoomSectionState s,
     FolderZoomGeometryLayer layer,
-    double targetEndScrollOffset, {
-    required bool isPortrait,
-  }) {
+    double targetEndScrollOffset,
+  ) {
     return _SliverAnimatedZoomGridLayout.maxChildIndexIn(
       layer: layer,
       targetEndScrollOffset: targetEndScrollOffset,
-      usableWidth: usableWidth,
-      outerWidth: outerWidth,
+      usableWidth: s.usableWidth,
+      outerWidth: s.outerWidth,
       isPortrait: isPortrait,
-      listMainAxisSpacing: listMainAxisSpacing,
-      gridCrossAxisSpacing: gridCrossAxisSpacing,
-      gridMainAxisSpacing: gridMainAxisSpacing,
+      listMainAxisSpacing: s.listMainAxisSpacing,
+      gridCrossAxisSpacing: s.gridCrossAxisSpacing,
+      gridMainAxisSpacing: s.gridMainAxisSpacing,
     );
+  }
+
+  /// 几何层的简短标记，例如 `lx1/w1.00/e74.0`、`gx4/w0.00/th0.0`。
+  static String _layerTag(FolderZoomGeometryLayer layer) {
+    final head = '${layer.isGrid ? 'g' : 'l'}x${layer.crossAxisCount}'
+        '/w${layer.weight.toStringAsFixed(2)}';
+    return layer.isGrid
+        ? '$head/th${layer.gridTextHeight.toStringAsFixed(1)}'
+        : '$head/e${layer.listExtent.toStringAsFixed(1)}';
   }
 }
 
@@ -1448,10 +1689,15 @@ class FolderZoomLayoutMetrics {
   /// 换档时焦点所在的视口高度比例（`0.5` = 视口中心，捏合时为双指中点）。
   final double focusFraction;
 
-  /// 本次过渡开始时冻结的"单侧可见条目"处置表。
+  /// 本次过渡开始时冻结的"单侧可见条目"处置表（默认段，即 `section == null`）。
   ///
   /// 为 `null` 时表示没有任何条目需要原地淡入淡出，全部按加权位移处理。
   final FolderZoomItemPinning? itemPinning;
+
+  /// 一页多个网格时，每个段各自的冻结表（键是 `SliverAnimatedZoomGridDelegate.section`）。
+  ///
+  /// 每段的条目索引都从 0 开始，共用一张表会让两段的条目互相顶替，所以必须按段分开。
+  final Map<Object?, FolderZoomItemPinning> sectionPinning;
 
   /// 本次过渡的线性进度（`0.0` → `1.0`），单侧条目的淡入淡出按它算不透明度。
   final double transitionProgress;
@@ -1479,8 +1725,15 @@ class FolderZoomLayoutMetrics {
     this.viewportTracker,
     this.focusFraction = kFolderZoomFocusCenter,
     this.itemPinning,
+    this.sectionPinning = const <Object?, FolderZoomItemPinning>{},
     this.transitionProgress = 0.0,
   });
+
+  /// 取某个段的冻结表；没注册过的段不会借用别人的分类结果。
+  FolderZoomItemPinning? pinningFor(Object? section) {
+    if (section == null) return itemPinning;
+    return sectionPinning[section];
+  }
 
   /// 解析指定 [index] 在当前帧的过渡状态。
   ///
@@ -1488,14 +1741,18 @@ class FolderZoomLayoutMetrics {
   /// - 起始 / 目标档位**都可见**的条目（绝大多数）走加权位移，位置由
   ///   [geometryLayers] 的混合给出（见 `_SliverAnimatedZoomGridLayout
   ///   .getGeometryForChildIndex`），不透明、不缩放。
-  /// - 只有一侧可见的条目位置被 [itemPinning] 锁死在该档位的屏幕位置上（布局侧
-  ///   不再移动它），这里只负责给出淡入 / 淡出的不透明度与缩放。
+  /// - 只有一侧可见的条目位置被 [pinningFor] 给出的冻结表锁死在该档位的屏幕位置上
+  ///   （布局侧不再移动它），这里只负责给出淡入 / 淡出的不透明度与缩放。
+  ///
+  /// [section] 必须与创建该条目时 `SliverAnimatedZoomGridDelegate.section` 一致；
+  /// 单列表用法留空即可。
   ///
   /// 分类结果在过渡开始时冻结，逐帧不会翻转 —— 这是"原地淡入淡出"能站住的前提，
   /// 细节见 [FolderZoomItemPinning]。
-  FolderZoomItemTransition resolveItemTransition(int index) {
+  FolderZoomItemTransition resolveItemTransition(int index, {Object? section}) {
+    final FolderZoomItemPinning? pinning = pinningFor(section);
     final FolderZoomItemPin pin =
-        itemPinning?.pinOf(index) ?? FolderZoomItemPin.shared;
+        pinning?.pinOf(index) ?? FolderZoomItemPin.shared;
     if (pin == FolderZoomItemPin.shared) {
       return FolderZoomItemTransition(
         isShared: true,
@@ -1506,7 +1763,7 @@ class FolderZoomLayoutMetrics {
     }
     final double t = transitionProgress.clamp(0.0, 1.0);
     final double visible =
-        itemPinning?.opacityAt(index, t) ?? (pin == FolderZoomItemPin.fadeOut ? 1.0 - t : t);
+        pinning?.opacityAt(index, t) ?? (pin == FolderZoomItemPin.fadeOut ? 1.0 - t : t);
     return FolderZoomItemTransition(
       isShared: false,
       opacity: visible,
@@ -1661,11 +1918,12 @@ class _FolderZoomSliverBuilderState extends State<FolderZoomSliverBuilder>
   double _startScrollPixels = 0.0;
   double _targetScrollPixels = 0.0;
 
-  /// 本次过渡开始时冻结的"单侧可见条目"处置表。
+  /// 本次过渡开始时冻结的"单侧可见条目"处置表（按段各一份，单列表时只有键 `null`）。
   ///
   /// 只在 [animate] 换档时生成一次，整段过渡复用（原因见 [FolderZoomItemPinning]）。
   /// 过渡结束 / 转入捏合时清空，避免下一段过渡沿用上一段的位置。
-  FolderZoomItemPinning? _itemPinning;
+  Map<Object?, FolderZoomItemPinning> _sectionPinning =
+      const <Object?, FolderZoomItemPinning>{};
 
   FolderZoomPinchController? _activePinchController;
   bool _pinchAnchorInitialized = false;
@@ -1679,14 +1937,15 @@ class _FolderZoomSliverBuilderState extends State<FolderZoomSliverBuilder>
   /// 位置必须随目标档位变化重算，不能在手势开始那一帧定死。
   double? _pinchTargetScale;
 
-  /// 捏合路径的"单侧可见条目"冻结表，与 [_itemPinning] 同一套机制。
+  /// 捏合路径的"单侧可见条目"冻结表（按段各一份），与 [_sectionPinning] 同一套机制。
   ///
   /// 捏合的进度由手指驱动、方向还可能中途反转，所以不能像点击换档那样在
   /// `_applyTargets` 里算一次：这里按 `(起始档位, 目标档位)` 缓存，方向确定的那一帧
   /// 冻结一次；目标反转时重算 —— 反转只可能发生在双指间距跨过手势起点
   /// （`progress ≈ 0`）的那一帧，此刻两层几何的权重正好是 `(1, 0)`，重算等价于
   /// 重新按起始档位判定，不会有条目从锁定位置瞬移。
-  FolderZoomItemPinning? _pinchPinning;
+  Map<Object?, FolderZoomItemPinning> _pinchPinning =
+      const <Object?, FolderZoomItemPinning>{};
   double? _pinchPinningFrom;
   double? _pinchPinningTo;
   bool _pinchPinningReady = false;
@@ -2076,31 +2335,26 @@ class _FolderZoomSliverBuilderState extends State<FolderZoomSliverBuilder>
         isPortrait: isPortrait,
       );
       final targetLayer = _layerOf(toTargets, 1.0);
-      final targetTop = _viewportTracker.solveViewportTopFor(
-        targetLayer,
-        isPortrait: isPortrait,
-      );
+      // 目标位置是**页面坐标**的绝对值：多段时 tracker 已经把上游各段高度变化
+      // 算了进去，这里再从当前像素累加差值会把它重复算一遍。
+      final double? targetPixels =
+          _viewportTracker.targetPixelsForLayer(targetLayer);
       // 上界**不夹取**，与点击档位那条路（`_applyTargets`）保持完全一致。
       //
       // 曾经这里按目标档位的 `maxScrollOffsetFor()` 夹取，那是个**单位错误**：
       // `maxScrollOffsetFor()` 返回的是 sliver 坐标（`内容总高 - 视口高`，且不含
       // 外层 `SliverPadding`），而 `_pinchTargetPixels` 是滚动像素 —— 两者相差
-      // 一个 `precede`（上方 padding / header 的高度）加上尾部 padding。于是只要
-      // 滚到列表底部，捏合的目标就被少算 `precede + 尾部 padding` 那么多：
-      // 点击换档精确贴底，捏合却停在离底还差一截的位置，整片内容偏下、最后一行
-      // 被切掉。header 越高偏得越多（实测 32px 到 400px 以上）。
+      // 一个外层 padding 加上尾部 padding。于是只要滚到列表底部，捏合的目标就被
+      // 少算那么多：点击换档精确贴底，捏合却停在离底还差一截的位置。
       //
       // 越界交给本次布局的 `applyContentDimensions` 纠正，和点击路径同款处理。
-      _pinchTargetPixels = math.max(
-        0.0,
-        _pinchBasePixels + (targetTop - _pinchBaseSliverOffset),
-      );
+      _pinchTargetPixels = math.max(0.0, targetPixels ?? _pinchBasePixels);
       _pinchTargetScale = pinch.targetZoomScale;
       zoomLog('pinch', () {
         return 'solve target=${zd(pinch.targetZoomScale, 3)} '
             'base=${zd(_pinchBasePixels)} '
             'baseSliver=${zd(_pinchBaseSliverOffset)} '
-            'targetTop=${zd(targetTop)} '
+            'targetPage=${zd(targetPixels)} '
             'targetPx=${zd(_pinchTargetPixels)} '
             'maxTarget=${zd(_viewportTracker.maxScrollOffsetFor(targetLayer, isPortrait: isPortrait))} '
             'maxCur=${zd(_maxExtentOf(position))} '
@@ -2417,19 +2671,19 @@ class _FolderZoomSliverBuilderState extends State<FolderZoomSliverBuilder>
   _ZoomTargets _targets() => _calculateTargets(widget.zoomScale);
 
   void _resetPinchPinning() {
-    _pinchPinning = null;
+    _pinchPinning = const <Object?, FolderZoomItemPinning>{};
     _pinchPinningFrom = null;
     _pinchPinningTo = null;
     _pinchPinningReady = false;
   }
 
-  /// 取本次捏合要用的"单侧可见条目"冻结表；方向未判定时返回 `null`。
+  /// 取本次捏合要用的"单侧可见条目"冻结表；方向未判定时返回空表。
   ///
   /// 少了它，捏合全程只能走"所有条目按两端几何加权位移"这一条路：只在起始档位
   /// 可见的条目也会跟着插值上下漂，屏幕上就是「双指一捏，整屏条目一起移动」。
   /// 点击换档之所以没有这个现象，是因为它走 [_applyTargets] 那条路，里面有
   /// [FolderZoomViewportTracker.buildPinning] 把单侧条目锁在原地淡入淡出。
-  FolderZoomItemPinning? _resolvePinchPinning({
+  Map<Object?, FolderZoomItemPinning> _resolvePinchPinning({
     required _ZoomTargets targetsFrom,
     required _ZoomTargets targetsTo,
     required bool isPortrait,
@@ -2441,7 +2695,7 @@ class _FolderZoomSliverBuilderState extends State<FolderZoomSliverBuilder>
     // 所有条目本来就落在起始档位的位置上，不需要冻结。
     if ((to - from).abs() <= 1e-4) {
       _resetPinchPinning();
-      return null;
+      return _pinchPinning;
     }
     if (_pinchPinningReady &&
         _pinchPinningFrom == from &&
@@ -2452,28 +2706,29 @@ class _FolderZoomSliverBuilderState extends State<FolderZoomSliverBuilder>
     // `mixLayers` 用**此刻屏幕上真实生效**的几何层：从点击换档的过渡动画中途
     // 接管时它就是那段动画的混合结果，锁在原位的参照系才是上一帧画出来的位置。
     final targetLayer = _layerOf(targetsTo, 1.0);
-    _pinchPinning = _viewportTracker.buildPinning(
-      mixLayers: _effectiveGeometryLayers(_curved.value),
-      targetLayer: targetLayer,
-      // 与布局侧 `_layerViewportTop(targetLayer)` 同一口径（含残差修正与夹取，
-      // 夹取上界已包含 [tailExtent]）。淡入条目的锁定位置在 `progress = 0`
-      // 处与目标位置严格相等，收尾（pinning 失效、单层接管）也不会弹一下。
-      targetViewportTop: _viewportTracker.viewportTopForLayer(
-        targetLayer,
+    final mixLayers = _effectiveGeometryLayers(_curved.value);
+    final built = <Object?, FolderZoomItemPinning>{};
+    for (final id in _viewportTracker.sectionIds) {
+      final pinning = _viewportTracker.buildPinning(
+        mixLayers: mixLayers,
+        targetLayer: targetLayer,
+        // 与布局侧 `_layerViewportTop(targetLayer)` 同一口径（含残差修正与夹取，
+        // 夹取上界已包含 [tailExtent]）。淡入条目的锁定位置在 `progress = 0`
+        // 处与目标位置严格相等，收尾（pinning 失效、单层接管）也不会弹一下。
+        targetViewportTop: _viewportTracker.viewportTopForLayer(
+          targetLayer,
+          section: id,
+          isPortrait: isPortrait,
+        ),
         isPortrait: isPortrait,
-      ),
-      isPortrait: isPortrait,
-    );
+        section: id,
+      );
+      if (pinning != null) built[id] = pinning;
+    }
+    _pinchPinning = built;
     _pinchPinningFrom = from;
     _pinchPinningTo = to;
     _pinchPinningReady = true;
-    zoomLog('pinch', () {
-      final pinning = _pinchPinning;
-      final String segments = pinning == null || pinning.isEmpty
-          ? 'none'
-          : '${pinning.firstPinnedIndex}..${pinning.lastPinnedIndex}';
-      return 'pinning ${zd(from, 3)} -> ${zd(to, 3)} segments=$segments';
-    });
     return _pinchPinning;
   }
 
@@ -2497,10 +2752,10 @@ class _FolderZoomSliverBuilderState extends State<FolderZoomSliverBuilder>
       final isPortrait =
           MediaQuery.maybeOrientationOf(context) == Orientation.portrait;
       final targetLayer = _layerOf(targets, 1.0);
-      final double targetSliverOffset = _viewportTracker.solveViewportTopFor(
-        targetLayer,
-        isPortrait: isPortrait,
-      );
+      // 目标滚动位置直接用**页面坐标**：tracker 已经把上游各段高度变化算进去了，
+      // 不需要（也不能）再从当前像素累加一次差值。
+      final double? targetPagePixels =
+          _viewportTracker.targetPixelsForLayer(targetLayer);
 
       final position = _scrollPosition();
       if (position != null &&
@@ -2508,13 +2763,12 @@ class _FolderZoomSliverBuilderState extends State<FolderZoomSliverBuilder>
           _viewportTracker.isActiveInViewport) {
         final currentPixels = position.pixels;
         _startSliverOffset = _sliverTopForPixels(currentPixels);
-        _targetSliverOffset = targetSliverOffset;
         _startScrollPixels = currentPixels;
-        _targetScrollPixels =
-            currentPixels + (_targetSliverOffset - _startSliverOffset);
+        _targetScrollPixels = targetPagePixels ?? currentPixels;
+        _targetSliverOffset = _targetScrollPixels;
       } else {
         _startSliverOffset = _viewportTracker.viewportTop;
-        _targetSliverOffset = targetSliverOffset;
+        _targetSliverOffset = targetPagePixels ?? _viewportTracker.viewportTop;
         _startScrollPixels = 0.0;
         _targetScrollPixels = 0.0;
       }
@@ -2527,18 +2781,32 @@ class _FolderZoomSliverBuilderState extends State<FolderZoomSliverBuilder>
       //
       // 上一段过渡还在跑（`_controller.isAnimating`）时把旧表带进来：已经被锁定
       // 的条目已经在"不跟几何走"的位置上，重新按混合几何判定会让它跳一截。
-      final previousPinning = _controller.isAnimating ? _itemPinning : null;
-      _itemPinning = tracker.buildPinning(
-        mixLayers: <FolderZoomGeometryLayer>[
-          for (final entry in _geometryFrom)
-            _layerOf(entry.targets, entry.weight),
-        ],
-        targetLayer: targetLayer,
-        targetViewportTop: targetSliverOffset,
-        isPortrait: isPortrait,
-        previous: previousPinning,
-        previousProgress: _curved.value,
-      );
+      //
+      // 一页多个网格时按段各冻结一份：每段的条目索引都从 0 开始。
+      final previousPinning = _controller.isAnimating
+          ? _sectionPinning
+          : const <Object?, FolderZoomItemPinning>{};
+      final mixLayers = <FolderZoomGeometryLayer>[
+        for (final entry in _geometryFrom) _layerOf(entry.targets, entry.weight),
+      ];
+      final built = <Object?, FolderZoomItemPinning>{};
+      for (final id in tracker.sectionIds) {
+        final pinning = tracker.buildPinning(
+          mixLayers: mixLayers,
+          targetLayer: targetLayer,
+          targetViewportTop: tracker.viewportTopForLayer(
+            targetLayer,
+            section: id,
+            isPortrait: isPortrait,
+          ),
+          isPortrait: isPortrait,
+          section: id,
+          previous: previousPinning[id],
+          previousProgress: _curved.value,
+        );
+        if (pinning != null) built[id] = pinning;
+      }
+      _sectionPinning = built;
 
       // 过渡起始时记下这一帧的全部输入：安卓真机上的"快速上下移动"如果来自
       // 求解出的目标与真实布局不一致，这里会直接暴露出来。
@@ -2582,7 +2850,7 @@ class _FolderZoomSliverBuilderState extends State<FolderZoomSliverBuilder>
       _geometryTo = targets;
       _startSliverOffset = _targetSliverOffset = _viewportTracker.viewportTop;
       _startScrollPixels = _targetScrollPixels = 0.0;
-      _itemPinning = null;
+      _sectionPinning = const <Object?, FolderZoomItemPinning>{};
       return;
     }
 
@@ -2753,7 +3021,8 @@ class _FolderZoomSliverBuilderState extends State<FolderZoomSliverBuilder>
           targetsFrom: targetsFrom,
           targetsTo: targetsTo,
           isPortrait: isPortrait,
-        ),
+        )[null],
+        sectionPinning: _pinchPinning,
         transitionProgress: t,
         startEndpointMetrics: _endpointMetrics(
           targetsFrom,
@@ -2809,7 +3078,10 @@ class _FolderZoomSliverBuilderState extends State<FolderZoomSliverBuilder>
       geometryLayers: _effectiveGeometryLayers(progress),
       zoomScaleDelta: _toZoomScale - _fromZoomScale,
       // 过渡结束（只剩单层）后不再需要冻结表：此时所有条目都已在终态位置上。
-      itemPinning: _controller.isAnimating ? _itemPinning : null,
+      itemPinning: _controller.isAnimating ? _sectionPinning[null] : null,
+      sectionPinning: _controller.isAnimating
+          ? _sectionPinning
+          : const <Object?, FolderZoomItemPinning>{},
       transitionProgress: progress,
       startEndpointMetrics: _endpointMetrics(
         startTargets,
@@ -2832,12 +3104,23 @@ class _FolderZoomSliverBuilderState extends State<FolderZoomSliverBuilder>
 class SliverAnimatedZoomGridDelegate extends SliverGridDelegate {
   const SliverAnimatedZoomGridDelegate({
     required this.metrics,
+    this.section,
     this.listMainAxisSpacing = kFolderListRowSpacing,
     this.gridCrossAxisSpacing = kGridCrossAxisSpacing,
     this.gridMainAxisSpacing = kGridMainAxisSpacing,
   });
 
   final FolderZoomLayoutMetrics metrics;
+
+  /// 本网格在页面里的身份，一页有多个网格时**必须各不相同**。
+  ///
+  /// 同一个 [FolderZoomSliverBuilder] 下挂几个网格时，滚动补偿要按"页面坐标"统一
+  /// 结算：下游网格会随上游网格的高度变化整体平移，这个平移量只有把各段区分开才能
+  /// 算对。留空表示"整页只有这一张网格"（行为与旧版完全一致）。
+  ///
+  /// 同一个 id 还要传给 [ZoomItemScaffold.section]，两边的条目索引才对得上。
+  final Object? section;
+
   final double listMainAxisSpacing;
   final double gridCrossAxisSpacing;
   final double gridMainAxisSpacing;
@@ -2883,6 +3166,7 @@ class SliverAnimatedZoomGridDelegate extends SliverGridDelegate {
         listMainAxisSpacing: listMainAxisSpacing,
         gridCrossAxisSpacing: gridCrossAxisSpacing,
         gridMainAxisSpacing: gridMainAxisSpacing,
+        section: section,
       );
     }
     return _SliverAnimatedZoomGridLayout(
@@ -2896,7 +3180,8 @@ class SliverAnimatedZoomGridDelegate extends SliverGridDelegate {
       gridCrossAxisSpacing: gridCrossAxisSpacing,
       gridMainAxisSpacing: gridMainAxisSpacing,
       tracker: tracker,
-      pinning: layers.length > 1 ? metrics.itemPinning : null,
+      section: section,
+      pinning: layers.length > 1 ? metrics.pinningFor(section) : null,
       progress: metrics.transitionProgress,
     );
   }
@@ -2909,6 +3194,7 @@ class SliverAnimatedZoomGridDelegate extends SliverGridDelegate {
         ) ||
         oldDelegate.metrics.outerWidth != metrics.outerWidth ||
         oldDelegate.metrics.isPortrait != metrics.isPortrait ||
+        oldDelegate.section != section ||
         oldDelegate.listMainAxisSpacing != listMainAxisSpacing ||
         oldDelegate.gridCrossAxisSpacing != gridCrossAxisSpacing ||
         oldDelegate.gridMainAxisSpacing != gridMainAxisSpacing;
@@ -2939,6 +3225,7 @@ class _SliverAnimatedZoomGridLayout extends SliverGridLayout {
     required this.gridCrossAxisSpacing,
     required this.gridMainAxisSpacing,
     this.tracker,
+    this.section,
     this.pinning,
     this.progress = 0.0,
   });
@@ -2954,6 +3241,9 @@ class _SliverAnimatedZoomGridLayout extends SliverGridLayout {
   final double gridMainAxisSpacing;
   final FolderZoomViewportTracker? tracker;
 
+  /// 本网格所属的段；一页多网格时靠它取到自己那一份视口顶部与冻结表。
+  final Object? section;
+
   /// 过渡开始时冻结的单侧可见条目处置表；见 [FolderZoomItemPinning]。
   final FolderZoomItemPinning? pinning;
 
@@ -2964,7 +3254,11 @@ class _SliverAnimatedZoomGridLayout extends SliverGridLayout {
 
   double _layerViewportTop(FolderZoomGeometryLayer layer) {
     if (tracker == null || !tracker!.hasMeasurement) return viewportTop;
-    return tracker!.viewportTopForLayer(layer, isPortrait: isPortrait);
+    return tracker!.viewportTopForLayer(
+      layer,
+      section: section,
+      isPortrait: isPortrait,
+    );
   }
 
   double get _viewportHeight {
@@ -3309,8 +3603,8 @@ class _SliverAnimatedZoomGridLayout extends SliverGridLayout {
 
   @override
   double computeMaxScrollOffset(int childCount) {
-    // 回填条目总数，tracker 才能在换算目标档位的滚动偏移时按各档位的最大偏移夹取。
-    tracker?.contentCount = childCount;
+    // 回填条目总数：tracker 要在换算目标档位的滚动偏移时按各档位的内容总高求解。
+    tracker?.setContentCount(section, childCount);
     if (childCount <= 0) return 0.0;
     if (_hasSingleLayer) {
       return _maxScrollOffsetIn(layers.first, childCount);

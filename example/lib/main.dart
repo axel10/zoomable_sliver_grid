@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:zoomable_sliver_grid/zoomable_sliver_grid.dart';
 
+import 'multi_list_page.dart';
+
 void main() {
   runApp(const ZoomableGridExampleApp());
 }
@@ -104,6 +106,17 @@ class _DemoHomePageState extends State<DemoHomePage> {
       appBar: AppBar(
         title: const Text('Zoomable Sliver Grid'),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.view_agenda_rounded),
+            tooltip: '一页两个列表',
+            onPressed: () {
+              Navigator.of(context).push(
+                MaterialPageRoute<void>(
+                  builder: (_) => const MultiListPage(),
+                ),
+              );
+            },
+          ),
           if (_isSelectionMode)
             IconButton(
               icon: const Icon(Icons.close_rounded),

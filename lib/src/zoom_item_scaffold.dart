@@ -490,9 +490,16 @@ class ZoomItemScaffold extends StatelessWidget {
   final Widget? titlePrefix;
   final Widget? titleSuffix;
 
+  /// 本条目所属的网格段，必须与 [SliverAnimatedZoomGridDelegate.section] 一致。
+  ///
+  /// 一页多个网格时，各段的条目索引都从 0 开始，只有把段带上才能取到自己的
+  /// 淡入 / 淡出分类。单列表用法留空即可。
+  final Object? section;
+
   const ZoomItemScaffold({
     super.key,
     required this.metrics,
+    this.section,
     this.cover,
     this.titleText,
     this.subtitleText,
@@ -542,7 +549,7 @@ class ZoomItemScaffold extends StatelessWidget {
       builder: (context, constraints) {
         final childIndex = _findSliverChildIndex(context);
         final transition = childIndex != null
-            ? metrics.resolveItemTransition(childIndex)
+            ? metrics.resolveItemTransition(childIndex, section: section)
             : null;
         final effectiveMetrics = transition?.effectiveMetrics ?? metrics;
         final isFadeScale = transition != null && !transition.isShared;
