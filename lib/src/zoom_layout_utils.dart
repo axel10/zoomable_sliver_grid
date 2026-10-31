@@ -571,6 +571,20 @@ class FolderZoomViewportTracker {
   /// 回弹模拟慢慢弹回来）。
   double Function()? scrollPixelsReader;
 
+  /// 读取当前滚动位置上界的回调（`ScrollPosition.maxScrollExtent`）。
+  ///
+  /// 用来算 [tailExtent]：真实可滚范围里，本 sliver 内容末端之后还有多长
+  /// （外层 `SliverPadding` 的尾部 padding、后面的其它 sliver）。`contentExtentIn()`
+  /// 只算条目本身，拿它当上界会让"内容比视口矮、页面却还能往下滚"的页面
+  /// （目录页底部避让浮动 Dock 的填充）在换档时被误夹。
+  double? Function()? scrollMaxPixelsReader;
+
+  /// 本 sliver 的内容末端之后、仍然能继续滚动的那段长度（sliver 坐标）。
+  ///
+  /// 稳态下每次布局都会刷新：`真实上界 − (内容总高 − 视口高)`。
+  /// 负数一律归零（正常情况下不会出现，出现说明读到的是过期上界）。
+  double tailExtent = 0.0;
+
   /// 最近一次布局时的滚动像素值。
   double? pixelsAtLayout;
 
@@ -669,6 +683,7 @@ class FolderZoomViewportTracker {
         focusFraction: focusFraction,
         isPortrait: isPortrait,
       );
+      _refreshTailExtent(layers.first, isPortrait: isPortrait);
       correction = 0.0;
       if (_wasMixing) {
         _wasMixing = false;
@@ -676,7 +691,8 @@ class FolderZoomViewportTracker {
           return 'settle top=${zd(viewportTop)} px=${zd(pixelsAtLayout)} '
               'anchor=${_anchorEdge.name}#$anchorIndex r=${zd(anchorRatio, 3)} '
               'f=${zd(anchorFocusY)} layer=${_layerTag(layers.first)} '
-              'max=${zd(maxScrollOffsetFor(layers.first, isPortrait: isPortrait))}';
+              'tail=${zd(tailExtent)} '
+              'max=${zd(maxViewportTopFor(layers.first, isPortrait: isPortrait))}';
         });
       }
       return;
@@ -759,13 +775,28 @@ class FolderZoomViewportTracker {
       anchorFocusY = 0.0;
       return;
     }
-    final double? maxOffset = maxScrollOffsetFor(layer, isPortrait: isPortrait);
-    if (maxOffset != null && maxOffset > 0.5 && viewportTop >= maxOffset - 0.5) {
-      _anchorEdge = _ZoomAnchorEdge.bottom;
-      anchorIndex = 0;
-      anchorRatio = 1.0;
-      anchorFocusY = height;
-      return;
+    // 底端判据：**内容末端已经进了视口**（视口顶部越过了"内容总高 − 视口高"）。
+    //
+    // 以前还要求 `maxOffset > 0.5`（内容必须比视口高），这个条件把最常见的目录页
+    // 挡在门外：文件夹少、底部还有一大块避让浮动 Dock 的 `SliverPadding` 时，
+    // 网格内容本身比视口矮（`contentExtent - viewportHeight` 是负数），但页面照样
+    // 能往下滚一百多像素。此时锚点落到 `none`，锚条目按"视口顶部还在内容里"去取，
+    // 取到的位置根本不在内容里；接着 `viewportTopForLayer()` 又把视口顶部夹回
+    // 内容范围 → 捏合第一帧整屏条目下掉一个 padding 的高度（实测 146px）。
+    //
+    // 内容比视口矮时 `contentMax` 是负数，"滚到它之上"同样成立，判据不需要额外的
+    // 下限门槛。条目总数还没回填（首帧）时算不出内容总高，退回不判底。
+    final int? count = contentCount;
+    if (count != null && count > 0) {
+      final double contentMax =
+          _contentExtentOf(layer, isPortrait: isPortrait) - height;
+      if (viewportTop >= contentMax - 0.5) {
+        _anchorEdge = _ZoomAnchorEdge.bottom;
+        anchorIndex = 0;
+        anchorRatio = 1.0;
+        anchorFocusY = height;
+        return;
+      }
     }
 
     _anchorEdge = _ZoomAnchorEdge.none;
@@ -911,12 +942,60 @@ class FolderZoomViewportTracker {
     double top = _anchorTopIn(layer, isPortrait: isPortrait) + correction;
     // 底部贴边时 `_anchorTopIn` 已由两端内容总高之差精确给出，不要再夹取。
     if (_anchorEdge != _ZoomAnchorEdge.bottom) {
-      final double? maxOffset = maxScrollOffsetFor(layer, isPortrait: isPortrait);
-      if (maxOffset != null) top = math.min(top, maxOffset);
+      final double? maxTop = maxViewportTopFor(layer, isPortrait: isPortrait);
+      if (maxTop != null) {
+        final double clamped = math.min(top, maxTop);
+        if ((clamped - top).abs() > 0.5) {
+          zoomLog('probe', () {
+            return 'layerTop clamped ${zd(top)} -> ${zd(clamped)} '
+                'maxTop=${zd(maxTop)} tail=${zd(tailExtent)} '
+                'layer=${_layerTag(layer)}';
+          });
+        }
+        top = clamped;
+      }
     }
     // 下界是"页面滚到 0"对应的坐标，不是 0：上方还有 header / padding 时它是负的。
     // 按 0 截断会把贴顶换档的目标算成"往上滚一整个 header 的高度"。
     return math.max(minViewportTop, top);
+  }
+
+  /// 稳态下刷新 [tailExtent]：真实可滚上界与本 sliver 内容末端之间还差多少。
+  ///
+  /// 只在单层稳态调用 —— 那时 `precede` 与 `contentExtent` 都是确定的，
+  /// 而过渡期的内容总高每帧在变，算出来的 tail 只会是中间值。
+  void _refreshTailExtent(
+    FolderZoomGeometryLayer layer, {
+    required bool isPortrait,
+  }) {
+    final double? maxPixels = scrollMaxPixelsReader?.call();
+    final int? count = contentCount;
+    if (maxPixels == null || count == null || count <= 0) return;
+    if (pixelsAtLayout == null) return;
+    if (viewportHeight <= 1.0) return;
+    final double maxTop = maxPixels - precede;
+    final double contentMax =
+        _contentExtentOf(layer, isPortrait: isPortrait) - viewportHeight;
+    final double tail = maxTop - contentMax;
+    // 只信任正向余量：读到过期上界（上一帧的内容长度）时会算出负数，保留旧值。
+    if (tail >= -0.5) tailExtent = math.max(0.0, tail);
+  }
+
+  /// [layer] 档位下视口顶部允许的最大值（= 内容末端贴到视口底 + 尾部余量）。
+  ///
+  /// 与 [maxScrollOffsetFor] 的差别只在那段 [tailExtent]：外层的尾部 padding
+  /// （目录页底部避让浮动 Dock 的填充）不属于本 sliver 的内容，但页面确实能滚
+  /// 到那里。拿不含它的上界去夹"假想视口顶"，会把整屏内容往上顶掉一个 padding。
+  double? maxViewportTopFor(
+    FolderZoomGeometryLayer layer, {
+    bool isPortrait = false,
+  }) {
+    final double? contentMax = maxScrollOffsetFor(
+      layer,
+      isPortrait: isPortrait,
+    );
+    if (contentMax == null) return null;
+    return contentMax + tailExtent;
   }
 
   /// 把焦点锚换算到 [layer] 档位的目标视口顶部偏移（不含残差修正、不夹取）。
@@ -1479,11 +1558,18 @@ const double kFolderZoomContentHandoffUpper = 0.55;
 /// 交接滞回下界。
 const double kFolderZoomContentHandoffLower = 0.45;
 
-/// 交接点两侧压暗半窗。
+/// 交接点两侧压暗半窗：越过滞回带之后，还要再走这么远才恢复到全不透明。
 const double kFolderZoomContentHandoffFadeHalfWindow = 0.12;
 
-/// 交接瞬间的内容不透明度下限。
-const double kFolderZoomContentHandoffMinOpacity = 0.55;
+/// 交接带内（`[下界, 上界]`）的内容不透明度。
+///
+/// 必须是 `0`：网格与列表的**内容排版**是两套完全不同的布局（封面在上 / 封面在左、
+/// 标题在封面下方 / 标题垂直居中），交接那一刻只能整份换掉、无法逐属性插值。
+/// 只要换的一瞬间还看得见，条目内部的封面与文字就会"跳"一下 —— 实测标题会在
+/// 交接帧瞬移 30~40px，而当时的不透明度还有 0.74（`|morph-0.5|` 与滞回阈值
+/// 0.45/0.55 不同源，是最初的实现留下的错位）。压到 0 之后，换布局发生在
+/// 完全看不见的那几帧里，视觉上只剩"淡出 → 淡入"。
+const double kFolderZoomContentHandoffMinOpacity = 0.0;
 
 /// Animates [FolderZoomLayoutMetrics] smoothly whenever `zoomScale` changes,
 /// and returns the sliver built by [builder].
@@ -1830,10 +1916,22 @@ class _FolderZoomSliverBuilderState extends State<FolderZoomSliverBuilder>
     return (position != null && position.hasPixels) ? position.pixels : 0.0;
   }
 
+  /// 当前滚动位置上界；内容尺寸还没算出来时返回 `null`。
+  ///
+  /// 只在 tracker 的稳态分支用来推算"内容末端之后还能滚多长"，
+  /// 所以宁可不给，也不要拿一个过期的 0 当上界。
+  double? _currentScrollMaxPixels() {
+    final position = _scrollPosition();
+    if (position == null || !position.hasPixels) return null;
+    if (!position.hasContentDimensions) return null;
+    return position.maxScrollExtent;
+  }
+
   @override
   void initState() {
     super.initState();
     _viewportTracker.scrollPixelsReader = _currentScrollPixels;
+    _viewportTracker.scrollMaxPixelsReader = _currentScrollMaxPixels;
     _controller = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 260),
@@ -1949,6 +2047,8 @@ class _FolderZoomSliverBuilderState extends State<FolderZoomSliverBuilder>
       _pinchBaseSliverOffset = _sliverTopForPixels(position.pixels);
       _pinchAnchorInitialized = true;
       _pinchTargetScale = null;
+      // 新手势重新记"翻面点"，别让上一段过渡的零点影响这一段的内容压暗。
+      _handoffFlipMorph = null;
       zoomLog('pinch', () {
         return 'begin base=${zd(pinch.baseZoomScale, 3)} '
             'px=${zd(_pinchBasePixels)} sliver=${zd(_pinchBaseSliverOffset)} '
@@ -2209,9 +2309,27 @@ class _FolderZoomSliverBuilderState extends State<FolderZoomSliverBuilder>
     } else {
       side = _contentSide != 0 ? _contentSide : (morph >= 0.5 ? 1 : -1);
     }
+    if (_contentSide != 0 && _contentSide != side) {
+      // 记下"真的换了布局"的那一帧的 morph。帧步进会越过阈值一截（实测
+      // 0.525 → 0.406），光按距离阈值算的话这一帧的不透明度又会回到 0.37。
+      _handoffFlipMorph = morph;
+    }
     _contentSide = side;
 
-    final double distance = (morph - 0.5).abs();
+    // 压暗的零点必须与**换布局的那一点**重合。
+    //
+    // 换布局发生在 `morph` 越过 0.45 / 0.55 的那一帧（滞回），两套内容排版
+    // 结构不同（封面在上 / 封面在左、标题在封面下方 / 标题垂直居中），只能
+    // 整份换、无法插值 —— 只要换的瞬间还看得见，条目内容就会"跳"一下。
+    // 所以有两个零点：滞回带边界（提前淡出）和真实的翻面帧（兜住帧步进
+    // 越过阈值的那个多走的量），取两者里更近的那个。
+    final double bandHalf =
+        (kFolderZoomContentHandoffUpper - kFolderZoomContentHandoffLower) * 0.5;
+    double distance = math.max(0.0, (morph - 0.5).abs() - bandHalf);
+    final double? flipMorph = _handoffFlipMorph;
+    if (flipMorph != null) {
+      distance = math.min(distance, (morph - flipMorph).abs());
+    }
     final double reveal = distance >= kFolderZoomContentHandoffFadeHalfWindow
         ? 1.0
         : kFolderZoomContentHandoffMinOpacity +
@@ -2219,6 +2337,9 @@ class _FolderZoomSliverBuilderState extends State<FolderZoomSliverBuilder>
                   (distance / kFolderZoomContentHandoffFadeHalfWindow);
     return (isGrid: side > 0, reveal: reveal);
   }
+
+  /// [FolderZoomSliverBuilder._resolveContentHandoff] 最近一次真正换布局时的 morph。
+  double? _handoffFlipMorph;
 
   _ZoomTargets _calculateTargets(
     double zoomScale, {
@@ -2334,8 +2455,9 @@ class _FolderZoomSliverBuilderState extends State<FolderZoomSliverBuilder>
     _pinchPinning = _viewportTracker.buildPinning(
       mixLayers: _effectiveGeometryLayers(_curved.value),
       targetLayer: targetLayer,
-      // 与布局侧 `_layerViewportTop(targetLayer)` 同一口径，淡入条目的锁定位置
-      // 在 `progress = 0` 处才与目标位置严格相等，不会出现起步一帧的位移。
+      // 与布局侧 `_layerViewportTop(targetLayer)` 同一口径（含残差修正与夹取，
+      // 夹取上界已包含 [tailExtent]）。淡入条目的锁定位置在 `progress = 0`
+      // 处与目标位置严格相等，收尾（pinning 失效、单层接管）也不会弹一下。
       targetViewportTop: _viewportTracker.viewportTopForLayer(
         targetLayer,
         isPortrait: isPortrait,
@@ -2360,6 +2482,7 @@ class _FolderZoomSliverBuilderState extends State<FolderZoomSliverBuilder>
 
     if (animate) {
       _selfHealBudget = 3;
+      _handoffFlipMorph = null;
       _collapseGeometry(_curved.value);
       _fromZoomScale = _eval(_fromZoomScale, _toZoomScale);
       _fromGridMorph = _eval(_fromGridMorph, _toGridMorph);
