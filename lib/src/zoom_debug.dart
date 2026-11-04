@@ -62,7 +62,7 @@ void zoomGeomProbe(
     _geomProbeLastThrottledAt = now;
   }
 
-  final int repeat = _geomProbeStates[channel]!.repeat;
-  debugPrint('[zoomGeom] ${message()}${repeat > 0 ? ' ×$repeat' : ''}');
+  // final int repeat = _geomProbeStates[channel]!.repeat;
+  // debugPrint('[zoomGeom] ${message()}${repeat > 0 ? ' ×$repeat' : ''}');
 }
 
