@@ -24,7 +24,7 @@ String zd(double? value, [int digits = 1]) =>
 /// `layout` / `maxScroll` 两个高频频道另加 120ms 节流，换档动画期间也不会刷屏。
 ///
 /// 定位结束后改回 `false`。
-bool folderZoomGeometryProbe = true;
+bool folderZoomGeometryProbe = false;
 
 /// 高频探针频道的最小输出间隔。
 const Duration kGeomProbeMinInterval = Duration(milliseconds: 120);

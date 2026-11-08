@@ -490,6 +490,12 @@ class ZoomItemScaffold extends StatelessWidget {
   final Widget? titlePrefix;
   final Widget? titleSuffix;
 
+  /// 本条目在 Sliver 列表/网格中的索引（即 `SliverChildBuilderDelegate(context, index)` 的 index）。
+  ///
+  /// 若显式传入，内部直接使用该索引计算过渡状态，彻底省去每帧 Layout 阶段沿
+  /// RenderObject 树向上递归回溯的开销；留空时自动回退为 [_findSliverChildIndex]。
+  final int? index;
+
   /// 本条目所属的网格段，必须与 [SliverAnimatedZoomGridDelegate.section] 一致。
   ///
   /// 一页多个网格时，各段的条目索引都从 0 开始，只有把段带上才能取到自己的
@@ -499,6 +505,7 @@ class ZoomItemScaffold extends StatelessWidget {
   const ZoomItemScaffold({
     super.key,
     required this.metrics,
+    this.index,
     this.section,
     this.cover,
     this.titleText,
@@ -547,7 +554,7 @@ class ZoomItemScaffold extends StatelessWidget {
   Widget build(BuildContext context) {
     return LayoutBuilder(
       builder: (context, constraints) {
-        final childIndex = _findSliverChildIndex(context);
+        final childIndex = index ?? _findSliverChildIndex(context);
         final transition = childIndex != null
             ? metrics.resolveItemTransition(childIndex, section: section)
             : null;
