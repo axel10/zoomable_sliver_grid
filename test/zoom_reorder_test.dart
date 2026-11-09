@@ -107,6 +107,53 @@ void main() {
     });
   });
 
+  group('固定条目（系统媒体库首位）', () {
+    ZoomReorderController makeController() {
+      final controller = ZoomReorderController();
+      addTearDown(controller.dispose);
+      return controller;
+    }
+
+    test('锁定索引不能起拖', () {
+      final controller = makeController();
+      controller.itemCount = 4;
+      controller.lockedIndices = const <int>{0};
+      controller.startDrag(0, Offset.zero);
+      expect(controller.isDragging, isFalse);
+      expect(controller.reorderActive.value, isFalse);
+    });
+
+    test('多选集合里的锁定索引会被过滤掉', () {
+      final controller = makeController();
+      controller.itemCount = 5;
+      controller.lockedIndices = const <int>{0};
+      controller.selectedIndices = <int>{0, 1, 3};
+      controller.startDrag(1, Offset.zero);
+      expect(controller.dragging.value, <int>{1, 3});
+      expect(controller.dragging.value.contains(0), isFalse);
+    });
+
+    test('minInsertIndex 夹住起拖时的初始落点', () {
+      final controller = makeController();
+      controller.itemCount = 4;
+      controller.minInsertIndex = 2;
+      controller.startDrag(1, Offset.zero);
+      expect(controller.insertIndex, 2);
+    });
+
+    test('插入位不越过下限时，重排后固定项仍在首位', () {
+      const items = <String>['system', 'a', 'b', 'c', 'd'];
+      // 插入位 1 表示「插到剩余列表第 1 位之前」，即固定前缀之后。
+      final reordered = ZoomReorderController.applyReorder<String>(
+        items,
+        <int>{2, 4},
+        1,
+      );
+      expect(reordered.first, 'system');
+      expect(reordered, <String>['system', 'b', 'd', 'a', 'c']);
+    });
+  });
+
   group('槽位几何', () {
     const listGeometry = ZoomReorderGeometry(
       isGrid: false,

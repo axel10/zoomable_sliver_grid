@@ -157,6 +157,16 @@ class ZoomReorderController extends ChangeNotifier {
   /// 合集在网格里占几个槽。列表态按需求压缩成 1 行，网格态默认也是 1 格。
   int placeholderCount;
 
+  /// 不允许起拖的原始索引（例如固定首位的「系统媒体库」）。
+  ///
+  /// 这些条目仍留在 [_remaining] 里参与补位，只是永远不会被 [startDrag]
+  /// 挑走；多选集合里也会先过滤掉它们。
+  Set<int> lockedIndices = const <int>{};
+
+  /// 插入位下限。锁定的条目若是列表前缀，把它设为前缀长度，
+  /// 否则合集可以被插到固定项前面，调用方过滤掉固定项后顺序就错位了。
+  int minInsertIndex = 0;
+
   /// 外部注入的坐标/滚动解析，包本身不持有页面结构。
   RenderBox? Function()? resolveBox;
   ScrollPosition? Function()? resolveScrollPosition;
@@ -190,10 +200,14 @@ class ZoomReorderController extends ChangeNotifier {
 
   void startDrag(int index, Offset globalPosition, {bool forceSingle = false}) {
     if (isDragging || index < 0 || index >= itemCount) return;
+    if (lockedIndices.contains(index)) return;
     final selection = selectedIndices;
     final Set<int> picked;
     if (!forceSingle && selection.length > 1 && selection.contains(index)) {
-      picked = selection.where((i) => i >= 0 && i < itemCount).toSet();
+      picked = selection
+          .where((i) =>
+              i >= 0 && i < itemCount && !lockedIndices.contains(i))
+          .toSet();
     } else {
       picked = <int>{index};
     }
@@ -208,7 +222,8 @@ class ZoomReorderController extends ChangeNotifier {
     for (final dragged in picked) {
       if (dragged < index) at--;
     }
-    insertIndex = at.clamp(0, _remaining.length).toInt();
+    final lowerBound = minInsertIndex.clamp(0, _remaining.length);
+    insertIndex = at.clamp(lowerBound, _remaining.length).toInt();
 
     pointer.value = globalPosition;
     dragging.value = Set<int>.unmodifiable(picked);
@@ -224,7 +239,11 @@ class ZoomReorderController extends ChangeNotifier {
     final box = resolveBox?.call();
     if (currentGeometry == null || box == null || !box.attached) return;
     final local = box.globalToLocal(globalPosition);
-    final next = currentGeometry.insertIndexFor(local, _remaining.length);
+    final lowerBound = minInsertIndex.clamp(0, _remaining.length);
+    final next = currentGeometry
+        .insertIndexFor(local, _remaining.length)
+        .clamp(lowerBound, _remaining.length)
+        .toInt();
     if (next != insertIndex) {
       insertIndex = next;
       notifyListeners();
@@ -559,8 +578,11 @@ class ZoomReorderableSliverGrid extends StatefulWidget {
     required this.onReorder,
     this.section,
     this.selectedIndices = const <int>{},
+    this.lockedIndices = const <int>{},
+    this.minInsertIndex = 0,
     this.enabled = true,
     this.showHandles = true,
+    this.handleChild,
     this.placeholderCount = 1,
     this.previewBuilder,
     this.controller,
@@ -578,10 +600,20 @@ class ZoomReorderableSliverGrid extends StatefulWidget {
 
   /// 段内索引集合；拖中其中一条即带走整组。
   final Set<int> selectedIndices;
+
+  /// 固定条目的原始索引：不显示可用手柄，也不能被拖走。
+  final Set<int> lockedIndices;
+
+  /// 插入位下限，用于保护 [lockedIndices] 中的前缀条目。
+  final int minInsertIndex;
   final bool enabled;
 
   /// 多选模式下应设为 true：右上角出现拖拽手柄。
   final bool showHandles;
+
+  /// 自定义手柄里的图标（不传用包内默认的 `drag_indicator_rounded`）。
+  /// 容器背景 / 边框 / 命中区域仍由 [ZoomReorderHandle] 负责。
+  final Widget? handleChild;
   final int placeholderCount;
   final ZoomReorderPreviewBuilder? previewBuilder;
 
@@ -678,6 +710,8 @@ class _ZoomReorderableSliverGridState
     _controller.geometry = geometry;
     _controller.itemCount = widget.itemCount;
     _controller.selectedIndices = widget.selectedIndices;
+    _controller.lockedIndices = widget.lockedIndices;
+    _controller.minInsertIndex = widget.minInsertIndex;
     _controller.placeholderCount = widget.placeholderCount;
     _controller.onReorder = widget.enabled ? widget.onReorder : null;
     _controller.resolveBox = () {
@@ -735,8 +769,9 @@ class _ZoomReorderableSliverGridState
     final rect = geometry.rectForSlot(slot ?? index);
     // 拖拽期间即使外部把 showHandles 关掉，也必须保留手柄层：起拖条目的
     // pointer 命中路径是在 down 时缓存的，换成别的 widget 会丢掉后续 move。
-    final showHandle =
-        widget.enabled && (widget.showHandles || _controller.isDragging);
+    final showHandle = widget.enabled &&
+        !widget.lockedIndices.contains(index) &&
+        (widget.showHandles || _controller.isDragging);
 
     return AnimatedPositioned(
       key: ValueKey<int>(index),
@@ -764,7 +799,10 @@ class _ZoomReorderableSliverGridState
               Positioned(
                 top: 4.0,
                 right: 4.0,
-                child: ZoomReorderHandle(index: index),
+                child: ZoomReorderHandle(
+                  index: index,
+                  child: widget.handleChild,
+                ),
               ),
           ],
         ),
