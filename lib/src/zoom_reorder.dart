@@ -176,6 +176,10 @@ class ZoomReorderController extends ChangeNotifier {
   final ValueNotifier<Set<int>> dragging =
       ValueNotifier<Set<int>>(const <int>{});
 
+  /// 起拖瞬间，指针相对于被起拖条目左上角的局部偏移。
+  /// 用于浮层对齐原位，避免浮层中心硬跳到指针上。
+  Offset? grabOffset;
+
   /// 给 [ZoomGestureLayer] 的冻结闸：拖拽期间不吃捏合 / 滚轮缩放。
   final ValueNotifier<bool> reorderActive = ValueNotifier<bool>(false);
 
@@ -225,6 +229,16 @@ class ZoomReorderController extends ChangeNotifier {
     final lowerBound = minInsertIndex.clamp(0, _remaining.length);
     insertIndex = at.clamp(lowerBound, _remaining.length).toInt();
 
+    final box = resolveBox?.call();
+    final currentGeometry = geometry;
+    if (box != null && box.attached && currentGeometry != null) {
+      final localDown = box.globalToLocal(globalPosition);
+      final itemRect = currentGeometry.rectForSlot(index);
+      grabOffset = localDown - itemRect.topLeft;
+    } else {
+      grabOffset = null;
+    }
+
     pointer.value = globalPosition;
     dragging.value = Set<int>.unmodifiable(picked);
     reorderActive.value = true;
@@ -263,6 +277,7 @@ class ZoomReorderController extends ChangeNotifier {
   void _finishDrag() {
     _autoScrollTimer?.cancel();
     _autoScrollTimer = null;
+    grabOffset = null;
     dragging.value = const <int>{};
     reorderActive.value = false;
     _remaining = const <int>[];
@@ -632,6 +647,7 @@ class _ZoomReorderableSliverGridState
   late final bool _ownsController;
   final GlobalKey _boxKey = GlobalKey();
   OverlayEntry? _overlay;
+  OverlayState? _overlayState;
 
   @override
   void initState() {
@@ -668,8 +684,10 @@ class _ZoomReorderableSliverGridState
   }
 
   void _showOverlay() {
-    final overlay = Overlay.maybeOf(context);
+    final overlay =
+        Overlay.maybeOf(context, rootOverlay: true) ?? Overlay.maybeOf(context);
     if (overlay == null) return;
+    _overlayState = overlay;
     final entry = OverlayEntry(builder: _buildOverlay);
     _overlay = entry;
     overlay.insert(entry);
@@ -678,6 +696,7 @@ class _ZoomReorderableSliverGridState
   void _hideOverlay() {
     _overlay?.remove();
     _overlay = null;
+    _overlayState = null;
   }
 
   Widget _buildOverlay(BuildContext overlayContext) {
@@ -686,9 +705,16 @@ class _ZoomReorderableSliverGridState
       builder: (context, pointer, _) {
         final size = _controller.geometry?.rectForSlot(0).size ??
             const Size(120.0, 120.0);
+        final overlayBox =
+            _overlayState?.context.findRenderObject() as RenderBox?;
+        final localPointer = overlayBox != null && overlayBox.attached
+            ? overlayBox.globalToLocal(pointer)
+            : pointer;
+        final grab = _controller.grabOffset ??
+            Offset(size.width * 0.5, size.height * 0.5);
         return Positioned(
-          left: pointer.dx - size.width * 0.5,
-          top: pointer.dy - size.height * 0.5,
+          left: localPointer.dx - grab.dx,
+          top: localPointer.dy - grab.dy,
           width: size.width,
           height: size.height,
           child: IgnorePointer(
