@@ -600,8 +600,7 @@ class ZoomItemScaffold extends StatelessWidget {
             (onContextMenu != null
                 ? (details) => onContextMenu!(details.globalPosition)
                 : null);
-        final effectiveLongPress = onLongPress ??
-            (onContextMenu != null ? () => onContextMenu!(Offset.zero) : null);
+        final effectiveLongPress = onLongPress;
 
         final listBgAlpha = (1.0 - gridMorph).clamp(0.0, 1.0);
         final Color itemBgColor;
