@@ -5,5 +5,6 @@ export 'src/zoom_item_scaffold.dart';
 export 'src/zoom_layout_utils.dart';
 export 'src/zoom_pinch.dart';
 export 'src/zoom_popover.dart';
+export 'src/zoom_reorder.dart';
 export 'src/zoom_tier_icon.dart';
 

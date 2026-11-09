@@ -27,6 +27,7 @@ class ZoomGestureLayer extends StatefulWidget {
     this.minScale = kFolderZoomTierMinimalList,
     this.maxScale = kFolderZoomTierLargeGrid,
     this.enableHaptics = true,
+    this.reorderActive,
   });
 
   final double zoomScale;
@@ -35,6 +36,12 @@ class ZoomGestureLayer extends StatefulWidget {
   final double minScale;
   final double maxScale;
   final bool enableHaptics;
+
+  /// 拖拽排序进行中时为 true：滚轮、触控板捏合、触屏双指缩放全部冻结。
+  ///
+  /// 传 [ZoomReorderController.reorderActive] 即可；不传表示本页没有重排功能，
+  /// 行为与之前完全一致。
+  final ValueListenable<bool>? reorderActive;
 
   @override
   State<ZoomGestureLayer> createState() => _ZoomGestureLayerState();
@@ -59,6 +66,8 @@ class _ZoomGestureLayerState extends State<ZoomGestureLayer>
   Duration? _lastWheelStamp;
   int _wheelBurstDirection = 0;
   bool _wheelBurstStepped = false;
+
+  bool get _isReordering => widget.reorderActive?.value ?? false;
 
   bool get _isZoomModifierPressed {
     final keyboard = HardwareKeyboard.instance;
@@ -106,6 +115,7 @@ class _ZoomGestureLayerState extends State<ZoomGestureLayer>
 
   void _handlePointerSignal(PointerSignalEvent event) {
     if (event is! PointerScrollEvent) return;
+    if (_isReordering) return;
     if (!_isZoomModifierPressed) return;
 
     final delta = event.scrollDelta;
@@ -146,6 +156,7 @@ class _ZoomGestureLayerState extends State<ZoomGestureLayer>
   static const double _kPinchActivateRatio = 1e-3;
 
   void _pushPinchScale(double scale, {Offset? focal}) {
+    if (_isReordering) return;
     if (_pinchController.isEnding) return;
     if (!_pinchController.isActive) {
       if ((scale - 1.0).abs() < _kPinchActivateRatio) return;
@@ -163,10 +174,12 @@ class _ZoomGestureLayerState extends State<ZoomGestureLayer>
   }
 
   void _handlePanZoomUpdate(PointerPanZoomUpdateEvent event) {
+    if (_isReordering) return;
     _pushPinchScale(event.scale, focal: event.position);
   }
 
   void _handlePanZoomEnd(PointerPanZoomEndEvent event) {
+    if (_isReordering) return;
     if (!_pinchController.isActive || _pinchController.isEnding) return;
     _pinchController.endPinch(onCommit: _commitPinchTier);
   }
@@ -177,7 +190,7 @@ class _ZoomGestureLayerState extends State<ZoomGestureLayer>
   bool _isTouch(PointerEvent event) => event.kind == PointerDeviceKind.touch;
 
   void _handleTouchDown(PointerDownEvent event) {
-    if (!_isTouch(event)) return;
+    if (!_isTouch(event) || _isReordering) return;
     _touchPointers[event.pointer] = event.position;
     if (_touchPointers.length >= 2) {
       _pinchBaseSpan = _currentSpan();
@@ -189,6 +202,7 @@ class _ZoomGestureLayerState extends State<ZoomGestureLayer>
   }
 
   void _handleTouchMove(PointerMoveEvent event) {
+    if (_isReordering) return;
     if (!_isTouch(event) || !_touchPointers.containsKey(event.pointer)) return;
     _touchPointers[event.pointer] = event.position;
 
@@ -270,7 +284,10 @@ class _ZoomGestureLayerState extends State<ZoomGestureLayer>
         gestures: <Type, GestureRecognizerFactory>{
           _ZoomPinchGestureRecognizer:
               GestureRecognizerFactoryWithHandlers<_ZoomPinchGestureRecognizer>(
-                () => _ZoomPinchGestureRecognizer(debugOwner: this),
+                () => _ZoomPinchGestureRecognizer(
+                      debugOwner: this,
+                      isEnabled: () => !_isReordering,
+                    ),
                 (_ZoomPinchGestureRecognizer instance) {},
               ),
         },
@@ -297,13 +314,20 @@ class _ZoomGestureLayerState extends State<ZoomGestureLayer>
 }
 
 class _ZoomPinchGestureRecognizer extends ScaleGestureRecognizer {
-  _ZoomPinchGestureRecognizer({super.debugOwner});
+  _ZoomPinchGestureRecognizer({
+    super.debugOwner,
+    required this.isEnabled,
+  });
+
+  /// 拖拽排序期间直接拒绝新指针，避免换位手势与双指捏合抢同一个 pointer。
+  final bool Function() isEnabled;
 
   @override
   bool isPointerPanZoomAllowed(PointerPanZoomStartEvent event) => false;
 
   @override
   bool isPointerAllowed(PointerDownEvent event) {
+    if (!isEnabled()) return false;
     return event.kind == PointerDeviceKind.touch && super.isPointerAllowed(event);
   }
 
