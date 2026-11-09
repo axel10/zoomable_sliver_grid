@@ -26,11 +26,13 @@ typedef ZoomReorderPreviewBuilder = Widget Function(
 /// 为直接拖拽的条目生成系统级 [DragItem]（例如携带外部应用或队列抽屉能识别的数据）。
 /// [selectedIndices] 为当前被一并拖拽的索引集合（若多选且当前项在已选列表中，则包含整组；否则仅包含当前项）。
 /// [localData] 已预先注入了本网格的签名字段（`_zoom_grid_id`、`_zoom_index`、`_zoom_indices`）。
+/// [request] 提供当前原生的拖拽请求上下文（例如用于注册内部拖拽会话 `session`）。
 typedef ZoomItemDragItemBuilder = FutureOr<DragItem> Function(
   int index,
   Set<int> selectedIndices,
-  Map<String, dynamic> localData,
-);
+  Map<String, dynamic> localData, [
+  DragItemRequest? request,
+]);
 
 /// 外部拖入或未匹配的数据在网格内松手时的回调。
 typedef ZoomExternalDropCallback = void Function(
@@ -971,6 +973,7 @@ class _ZoomReorderableSliverGridState
               index,
               pickedIndices,
               local,
+              request,
             );
           }
           item ??= DragItem(localData: local);
