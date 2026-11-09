@@ -591,6 +591,7 @@ class ZoomReorderableSliverGrid extends StatefulWidget {
     required this.itemCount,
     required this.itemBuilder,
     required this.onReorder,
+    this.itemKeyBuilder,
     this.section,
     this.selectedIndices = const <int>{},
     this.lockedIndices = const <int>{},
@@ -609,6 +610,13 @@ class ZoomReorderableSliverGrid extends StatefulWidget {
   final int itemCount;
   final Widget Function(BuildContext context, int index) itemBuilder;
   final ZoomReorderCallback onReorder;
+
+  /// 为每个条目提供稳定的 [Key]。
+  ///
+  /// 重排后条目在列表中的下标（index）会改变。如果提供稳定的 Key（例如基于条目的业务 ID），
+  /// Flutter 能在重排后精准匹配条目的 Element，彻底杜绝松手时被交换位置的条目
+  /// 因复用拖拽项的 Element 而闪烁或发生非预期动画的问题。
+  final Key? Function(int index)? itemKeyBuilder;
 
   /// 一页多段时的段身份，禁止跨段插入。
   final Object? section;
@@ -792,29 +800,37 @@ class _ZoomReorderableSliverGridState
   ) {
     final slot = _controller.displaySlotOf(index);
     final hidden = slot == null;
-    final rect = geometry.rectForSlot(slot ?? index);
+    final int effectiveSlot;
+    if (slot != null) {
+      effectiveSlot = slot;
+    } else {
+      final dragged = _controller.dragging.value.toList()..sort();
+      final rank = dragged.indexOf(index);
+      effectiveSlot = rank >= 0 ? _controller.insertIndex + rank : index;
+    }
+    final rect = geometry.rectForSlot(effectiveSlot);
     // 拖拽期间即使外部把 showHandles 关掉，也必须保留手柄层：起拖条目的
     // pointer 命中路径是在 down 时缓存的，换成别的 widget 会丢掉后续 move。
     final showHandle = widget.enabled &&
         !widget.lockedIndices.contains(index) &&
         (widget.showHandles || _controller.isDragging);
+    final itemKey = widget.itemKeyBuilder?.call(index) ?? ValueKey<int>(index);
 
     return AnimatedPositioned(
-      key: ValueKey<int>(index),
+      key: itemKey,
       duration: widget.animationDuration,
       curve: Curves.easeOutCubic,
       left: rect.left,
       top: rect.top,
       width: rect.width,
       height: rect.height,
-      child: AnimatedOpacity(
-        duration: const Duration(milliseconds: 130),
+      child: Opacity(
         opacity: hidden ? 0.0 : 1.0,
         child: Stack(
           clipBehavior: Clip.none,
           children: <Widget>[
             Positioned.fill(
-              // 被拖走的条目只是变透明，仍留在原槽位；屏蔽内容区的幽灵点击，
+              // 被拖走的条目只是变透明；屏蔽内容区的幽灵点击，
               // 但手柄挂在 Stack 外层，不受影响（拖拽链路要靠它续命）。
               child: IgnorePointer(
                 ignoring: hidden,

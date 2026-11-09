@@ -149,6 +149,8 @@ class _ReorderDemoPageState extends State<ReorderDemoPage> {
                       metrics: metrics,
                       width: constraints.maxWidth,
                       itemCount: _items.length,
+                      itemKeyBuilder: (index) =>
+                          ValueKey<int>(_items[index].id),
                       controller: _reorderController,
                       selectedIndices: _selectedIndices,
                       showHandles: _selectionMode || _alwaysShowHandles,
