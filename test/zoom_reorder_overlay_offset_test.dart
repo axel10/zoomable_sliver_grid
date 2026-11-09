@@ -40,7 +40,7 @@ void main() {
                             width: 1200.0 - sidebarWidth,
                             itemCount: 4,
                             showHandles: true,
-                            onReorder: (_, __) {},
+                            onReorder: (_, _) {},
                             itemBuilder: (context, index) => Container(
                               color: Colors.blue,
                               child: Text('Item $index'),

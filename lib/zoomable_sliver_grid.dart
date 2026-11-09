@@ -1,3 +1,5 @@
+export 'package:super_drag_and_drop/super_drag_and_drop.dart';
+
 export 'src/zoom_debug.dart';
 export 'src/zoom_gesture_layer.dart';
 export 'src/zoom_item_cover.dart';

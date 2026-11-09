@@ -49,6 +49,19 @@ dev_dependencies:
   # rules and activating additional ones.
   flutter_lints: ^6.0.0
 
+dependency_overrides:
+  native_toolchain_rust: 1.0.4+0
+  super_clipboard:
+    git: 
+      url: https://github.com/axel10/super_native_extensions
+      path: super_clipboard
+      ref: a6b1fe1471e8f7af354bedcfb0c89f42bcf24d16
+  super_native_extensions:
+    git: 
+      url: https://github.com/axel10/super_native_extensions
+      path: super_native_extensions
+      ref: a6b1fe1471e8f7af354bedcfb0c89f42bcf24d16
+
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec
 

@@ -1,13 +1,13 @@
 import 'package:flutter/material.dart';
 import 'package:zoomable_sliver_grid/zoomable_sliver_grid.dart';
 
-/// 拖拽排序验收页：网格 / 列表两种档位，单条拖拽与多选合集拖拽。
+/// 拖拽排序验收页：网格 / 列表两种档位，支持非多选鼠标直接拖拽与多选手柄集合拖拽。
 ///
 /// 操作方式：
-/// - 长按任意条目进入多选（只选一条就是单条拖拽）；
-/// - 拖条目**右上角的拖拽手柄**起拖，多条选中时会收拢成一个合集；
-/// - 拖动过程中余下条目自动填补空位，并在指针位置避让出合集落点；
-/// - 松手把合集一次性插入到落点。
+/// - 【非多选状态】：直接鼠标按住条目拖拽。在列表内移动显示高亮插入指示线，松手完成排序；
+///   拖到右侧「模拟队列抽屉」松手，可直接将条目加入队列。
+/// - 【多选状态】：长按条目进入多选，拖条目**右上角的拖拽手柄**起拖，多条选中时收拢成合集避让；
+///   松手把合集一次性插入到落点。
 class ReorderDemoPage extends StatefulWidget {
   const ReorderDemoPage({super.key});
 
@@ -57,6 +57,10 @@ class _ReorderDemoPageState extends State<ReorderDemoPage> {
       _icons[index % _icons.length],
     ),
   );
+
+  final List<String> _mockQueue = <String>[];
+  bool _isQueueHovered = false;
+  bool _showQueueDrawer = true;
 
   double _zoomScale = kFolderZoomTierSmallGrid;
   final Set<int> _selectedIds = <int>{};
@@ -125,6 +129,15 @@ class _ReorderDemoPageState extends State<ReorderDemoPage> {
               tooltip: '清除选择',
               onPressed: _clearSelection,
             ),
+          IconButton(
+            icon: Icon(
+              _showQueueDrawer
+                  ? Icons.view_sidebar_rounded
+                  : Icons.view_sidebar_outlined,
+            ),
+            tooltip: _showQueueDrawer ? '隐藏队列面板' : '展开队列面板',
+            onPressed: () => setState(() => _showQueueDrawer = !_showQueueDrawer),
+          ),
           ZoomButton(
             zoomScale: _zoomScale,
             onZoomScaleChanged: _setZoom,
@@ -132,42 +145,206 @@ class _ReorderDemoPageState extends State<ReorderDemoPage> {
           const SizedBox(width: 8),
         ],
       ),
-      body: LayoutBuilder(
-        builder: (context, constraints) {
-          return ZoomGestureLayer(
-            zoomScale: _zoomScale,
-            onZoomScaleChanged: _setZoom,
-            reorderActive: _reorderController.reorderActive,
-            child: FolderZoomSliverBuilder(
-              zoomScale: _zoomScale,
-              width: constraints.maxWidth,
-              builder: (context, metrics) {
-                return CustomScrollView(
-                  slivers: <Widget>[
-                    SliverToBoxAdapter(child: _buildControlPanel(metrics)),
-                    ZoomReorderableSliverGrid(
-                      metrics: metrics,
-                      width: constraints.maxWidth,
-                      itemCount: _items.length,
-                      itemKeyBuilder: (index) =>
-                          ValueKey<int>(_items[index].id),
-                      controller: _reorderController,
-                      selectedIndices: _selectedIndices,
-                      showHandles: _selectionMode || _alwaysShowHandles,
-                      placeholderCount: _useFullPlaceholder
-                          ? (_selectedIds.length > 1 ? _selectedIds.length : 1)
-                          : 1,
-                      onReorder: _handleReorder,
-                      itemBuilder: (context, index) =>
-                          _buildItem(context, metrics, index),
-                    ),
-                    const SliverToBoxAdapter(child: SizedBox(height: 32)),
-                  ],
+      body: Row(
+        children: <Widget>[
+          Expanded(
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                return ZoomGestureLayer(
+                  zoomScale: _zoomScale,
+                  onZoomScaleChanged: _setZoom,
+                  reorderActive: _reorderController.reorderActive,
+                  child: FolderZoomSliverBuilder(
+                    zoomScale: _zoomScale,
+                    width: constraints.maxWidth,
+                    builder: (context, metrics) {
+                      return CustomScrollView(
+                        slivers: <Widget>[
+                          SliverToBoxAdapter(child: _buildControlPanel(metrics)),
+                          ZoomReorderableSliverGrid(
+                            metrics: metrics,
+                            width: constraints.maxWidth,
+                            itemCount: _items.length,
+                            itemKeyBuilder: (index) =>
+                                ValueKey<int>(_items[index].id),
+                            controller: _reorderController,
+                            selectedIndices: _selectedIndices,
+                            showHandles: _selectionMode || _alwaysShowHandles,
+                            placeholderCount: _useFullPlaceholder
+                                ? (_selectedIds.length > 1
+                                    ? _selectedIds.length
+                                    : 1)
+                                : 1,
+                            onReorder: _handleReorder,
+                            itemDragItemBuilder: (index, localData) {
+                              final item = _items[index];
+                              final dragItem = DragItem(
+                                localData: {
+                                  ...localData,
+                                  'title': 'Track ${item.id + 1}',
+                                },
+                              );
+                              dragItem.add(
+                                Formats.plainText('Track ${item.id + 1} - Acoustic Echo'),
+                              );
+                              return dragItem;
+                            },
+                            itemBuilder: (context, index) =>
+                                _buildItem(context, metrics, index),
+                          ),
+                          const SliverToBoxAdapter(child: SizedBox(height: 32)),
+                        ],
+                      );
+                    },
+                  ),
                 );
               },
             ),
-          );
-        },
+          ),
+          if (_showQueueDrawer) _buildMockQueuePanel(),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildMockQueuePanel() {
+    final theme = Theme.of(context);
+    return Container(
+      width: 240,
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainer,
+        border: Border(
+          left: BorderSide(
+            color: theme.colorScheme.outlineVariant.withValues(alpha: 0.5),
+          ),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: <Widget>[
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 16, 16, 12),
+            child: Row(
+              children: <Widget>[
+                const Icon(Icons.queue_music_rounded, size: 20),
+                const SizedBox(width: 8),
+                Text(
+                  '播放队列抽屉',
+                  style: theme.textTheme.titleMedium?.copyWith(
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const Spacer(),
+                if (_mockQueue.isNotEmpty)
+                  IconButton(
+                    icon: const Icon(Icons.delete_outline_rounded, size: 18),
+                    tooltip: '清空',
+                    onPressed: () => setState(() => _mockQueue.clear()),
+                  ),
+              ],
+            ),
+          ),
+          Expanded(
+            child: DropRegion(
+              formats: Formats.standardFormats,
+              hitTestBehavior: HitTestBehavior.opaque,
+              onDropOver: (event) {
+                if (!_isQueueHovered) {
+                  setState(() => _isQueueHovered = true);
+                }
+                return DropOperation.copy;
+              },
+              onDropLeave: (_) {
+                if (_isQueueHovered) {
+                  setState(() => _isQueueHovered = false);
+                }
+              },
+              onDropEnded: (_) {
+                if (_isQueueHovered) {
+                  setState(() => _isQueueHovered = false);
+                }
+              },
+              onPerformDrop: (event) async {
+                setState(() => _isQueueHovered = false);
+                final item = event.session.items.firstOrNull;
+                String addedTitle = '未知条目';
+                if (item?.localData is Map) {
+                  final map = item!.localData as Map;
+                  if (map['title'] != null) {
+                    addedTitle = map['title'].toString();
+                  }
+                }
+                setState(() {
+                  _mockQueue.add(addedTitle);
+                });
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(
+                    content: Text('已将 $addedTitle 加入播放队列！'),
+                    duration: const Duration(seconds: 1),
+                  ),
+                );
+              },
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 180),
+                margin: const EdgeInsets.all(12),
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: _isQueueHovered
+                      ? theme.colorScheme.primaryContainer.withValues(alpha: 0.35)
+                      : theme.colorScheme.surfaceContainerHigh,
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(
+                    color: _isQueueHovered
+                        ? theme.colorScheme.primary
+                        : theme.colorScheme.outlineVariant.withValues(alpha: 0.4),
+                    width: _isQueueHovered ? 2.0 : 1.0,
+                  ),
+                ),
+                child: _mockQueue.isEmpty
+                    ? Center(
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: <Widget>[
+                            Icon(
+                              Icons.drag_indicator_rounded,
+                              size: 32,
+                              color: theme.colorScheme.onSurfaceVariant,
+                            ),
+                            const SizedBox(height: 8),
+                            Text(
+                              '直接拖拽条目到这里\n即可添加至队列',
+                              textAlign: TextAlign.center,
+                              style: theme.textTheme.bodySmall?.copyWith(
+                                color: theme.colorScheme.onSurfaceVariant,
+                              ),
+                            ),
+                          ],
+                        ),
+                      )
+                    : ListView.builder(
+                        itemCount: _mockQueue.length,
+                        itemBuilder: (context, index) {
+                          return ListTile(
+                            dense: true,
+                            contentPadding: EdgeInsets.zero,
+                            leading: CircleAvatar(
+                              radius: 12,
+                              child: Text(
+                                '${index + 1}',
+                                style: const TextStyle(fontSize: 10),
+                              ),
+                            ),
+                            title: Text(
+                              _mockQueue[index],
+                              style: theme.textTheme.bodySmall,
+                            ),
+                          );
+                        },
+                      ),
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -224,9 +401,11 @@ class _ReorderDemoPageState extends State<ReorderDemoPage> {
           ),
           const SizedBox(height: 4),
           Text(
-            '长按条目进入多选（选 1 条 = 单条拖拽，选多条 = 合集拖拽）；'
-            '拖右上角手柄移动，松手插入。拖到上下边缘会自动滚动。',
-            style: theme.textTheme.bodySmall,
+            '【非多选】直接鼠标拖拽条目：列表内显示高亮线排序，拖到右侧抽屉加入队列；\n'
+            '【多选】长按进入多选，右上角手柄起拖合集，多选挤开逻辑不受影响。',
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: theme.colorScheme.primary,
+            ),
           ),
         ],
       ),

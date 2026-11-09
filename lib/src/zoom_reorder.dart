@@ -1,8 +1,11 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:math' as math;
 
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:super_drag_and_drop/super_drag_and_drop.dart';
 
 import 'zoom_layout_utils.dart';
 
@@ -18,6 +21,19 @@ typedef ZoomReorderPreviewBuilder = Widget Function(
   BuildContext context,
   Set<int> draggedIndices,
   int count,
+);
+
+/// 为直接拖拽的条目生成系统级 [DragItem]（例如携带外部应用或队列抽屉能识别的数据）。
+/// [localData] 已预先注入了本网格的签名字段（`_zoom_grid_id` 和 `_zoom_index`）。
+typedef ZoomItemDragItemBuilder = FutureOr<DragItem> Function(
+  int index,
+  Map<String, dynamic> localData,
+);
+
+/// 外部拖入或未匹配的数据在网格内松手时的回调。
+typedef ZoomExternalDropCallback = void Function(
+  PerformDropEvent event,
+  int insertIndex,
 );
 
 /// 稳态档位下每个槽位的几何。
@@ -603,6 +619,12 @@ class ZoomReorderableSliverGrid extends StatefulWidget {
     this.previewBuilder,
     this.controller,
     this.animationDuration = const Duration(milliseconds: 220),
+    this.enableDirectDrag = true,
+    this.itemDragItemBuilder,
+    this.directDragPreviewBuilder,
+    this.dropIndicatorColor,
+    this.dropIndicatorThickness = 3.0,
+    this.onExternalDrop,
   });
 
   final FolderZoomLayoutMetrics metrics;
@@ -644,6 +666,31 @@ class ZoomReorderableSliverGrid extends StatefulWidget {
   final ZoomReorderController? controller;
   final Duration animationDuration;
 
+  /// 是否在非多选状态下允许鼠标直接在条目上按住起拖（基于系统拖拽，支持在列表内排序或拖出到外部目标）。
+  final bool enableDirectDrag;
+
+  /// 自定义条目直接拖拽时发布的系统级 [DragItem]（可携带文件路径或 URI 等，用于拖出到外部接收区）。
+  final ZoomItemDragItemBuilder? itemDragItemBuilder;
+
+  /// 条目直接拖拽时的浮动预览构建器。如果不传，默认展示带圆角阴影的条目本身快照。
+  final Widget Function(BuildContext context, int index)? directDragPreviewBuilder;
+
+  /// 高亮插入指示线颜色。
+  final Color? dropIndicatorColor;
+
+  /// 高亮插入指示线粗细（默认 3.0）。
+  final double dropIndicatorThickness;
+
+  /// 外部数据拖入并在指示线处释放时的回调。
+  final ZoomExternalDropCallback? onExternalDrop;
+
+  /// 是否支持系统级桌面拖拽（在测试环境或非桌面端平台自动禁用）。
+  static bool get isNativeDragSupported {
+    if (kIsWeb) return false;
+    if (Platform.environment.containsKey('FLUTTER_TEST')) return false;
+    return Platform.isWindows || Platform.isMacOS || Platform.isLinux;
+  }
+
   @override
   State<ZoomReorderableSliverGrid> createState() =>
       _ZoomReorderableSliverGridState();
@@ -653,9 +700,13 @@ class _ZoomReorderableSliverGridState
     extends State<ZoomReorderableSliverGrid> {
   late final ZoomReorderController _controller;
   late final bool _ownsController;
+  late final String _gridId = 'zoom_grid_${identityHashCode(this)}';
   final GlobalKey _boxKey = GlobalKey();
   OverlayEntry? _overlay;
   OverlayState? _overlayState;
+
+  int? _nativeDropInsertIndex;
+  bool _isNativeDropOver = false;
 
   @override
   void initState() {
@@ -759,36 +810,107 @@ class _ZoomReorderableSliverGridState
     _controller.resolveViewportHeight = () => MediaQuery.sizeOf(context).height;
   }
 
+  FutureOr<DropOperation> _handleNativeDropOver(
+    DropOverEvent event,
+    ZoomReorderGeometry geometry,
+  ) {
+    final local = event.position.local;
+    final insertIndex = geometry.insertIndexFor(local, widget.itemCount);
+
+    if (_nativeDropInsertIndex != insertIndex) {
+      setState(() {
+        _nativeDropInsertIndex = insertIndex;
+        _isNativeDropOver = true;
+      });
+    }
+
+    final localData = event.session.items.firstOrNull?.localData;
+    if (localData is Map && localData['_zoom_grid_id'] == _gridId) {
+      return DropOperation.move;
+    }
+    return DropOperation.copy;
+  }
+
+  void _clearNativeDrop() {
+    if (_nativeDropInsertIndex != null || _isNativeDropOver) {
+      setState(() {
+        _nativeDropInsertIndex = null;
+        _isNativeDropOver = false;
+      });
+    }
+  }
+
+  Future<void> _handleNativePerformDrop(PerformDropEvent event) async {
+    final targetIndex = _nativeDropInsertIndex;
+    _clearNativeDrop();
+    if (targetIndex == null) return;
+
+    final firstItem = event.session.items.firstOrNull;
+    final localData = firstItem?.localData;
+
+    if (localData is Map && localData['_zoom_grid_id'] == _gridId) {
+      final draggedIndex = localData['_zoom_index'];
+      if (draggedIndex is int) {
+        widget.onReorder({draggedIndex}, targetIndex);
+        return;
+      }
+    }
+
+    widget.onExternalDrop?.call(event, targetIndex);
+  }
+
   @override
   Widget build(BuildContext context) {
     final geometry = ZoomReorderGeometry.from(widget.metrics, widget.width);
     _syncController(geometry);
 
-    // Scope 放在 AnimatedBuilder 外层：拖拽期每次 notify 只重建内部子树，
-    // InheritedWidget 的 element 保持稳定，不会让手柄的依赖关系错乱。
+    final showDirectDrag = widget.enabled &&
+        widget.enableDirectDrag &&
+        ZoomReorderableSliverGrid.isNativeDragSupported &&
+        !widget.showHandles &&
+        widget.selectedIndices.isEmpty &&
+        !_controller.isDragging;
+
+    final content = AnimatedBuilder(
+      animation: _controller,
+      builder: (context, _) {
+        final slotCount = _controller.slotCount;
+        final height = math.max(1.0, geometry.contentHeightFor(slotCount));
+        return SizedBox(
+          key: _boxKey,
+          width: widget.width,
+          height: height,
+          child: Stack(
+            clipBehavior: Clip.none,
+            children: <Widget>[
+              for (var i = 0; i < widget.itemCount; i++)
+                _buildItem(context, i, geometry, showDirectDrag),
+              if (_controller.isDragging) _buildPlaceholder(geometry),
+              if (_nativeDropInsertIndex != null)
+                _buildNativeDropIndicator(geometry),
+            ],
+          ),
+        );
+      },
+    );
+
+    final sliverChild = (ZoomReorderableSliverGrid.isNativeDragSupported &&
+            (showDirectDrag || widget.onExternalDrop != null))
+        ? DropRegion(
+            formats: Formats.standardFormats,
+            hitTestBehavior: HitTestBehavior.opaque,
+            onDropOver: (event) => _handleNativeDropOver(event, geometry),
+            onDropLeave: (event) => _clearNativeDrop(),
+            onDropEnded: (event) => _clearNativeDrop(),
+            onPerformDrop: (event) => _handleNativePerformDrop(event),
+            child: content,
+          )
+        : content;
+
     return ZoomReorderScope(
       controller: _controller,
-      child: AnimatedBuilder(
-        animation: _controller,
-        builder: (context, _) {
-          final slotCount = _controller.slotCount;
-          final height = math.max(1.0, geometry.contentHeightFor(slotCount));
-          return SliverToBoxAdapter(
-            child: SizedBox(
-              key: _boxKey,
-              width: widget.width,
-              height: height,
-              child: Stack(
-                clipBehavior: Clip.none,
-                children: <Widget>[
-                  for (var i = 0; i < widget.itemCount; i++)
-                    _buildItem(context, i, geometry),
-                  if (_controller.isDragging) _buildPlaceholder(geometry),
-                ],
-              ),
-            ),
-          );
-        },
+      child: SliverToBoxAdapter(
+        child: sliverChild,
       ),
     );
   }
@@ -797,6 +919,7 @@ class _ZoomReorderableSliverGridState
     BuildContext context,
     int index,
     ZoomReorderGeometry geometry,
+    bool showDirectDrag,
   ) {
     final slot = _controller.displaySlotOf(index);
     final hidden = slot == null;
@@ -816,6 +939,53 @@ class _ZoomReorderableSliverGridState
         (widget.showHandles || _controller.isDragging);
     final itemKey = widget.itemKeyBuilder?.call(index) ?? ValueKey<int>(index);
 
+    Widget innerChild = widget.itemBuilder(context, index);
+
+    if (showDirectDrag && !widget.lockedIndices.contains(index)) {
+      innerChild = DragItemWidget(
+        allowedOperations: () => const [DropOperation.move, DropOperation.copy],
+        dragItemProvider: (request) async {
+          final local = <String, dynamic>{
+            '_zoom_grid_id': _gridId,
+            '_zoom_index': index,
+          };
+          DragItem? item;
+          if (widget.itemDragItemBuilder != null) {
+            item = await widget.itemDragItemBuilder!(index, local);
+          }
+          item ??= DragItem(localData: local);
+          if (item.localData is Map) {
+            final map = item.localData as Map;
+            map['_zoom_grid_id'] = _gridId;
+            map['_zoom_index'] = index;
+          }
+          return item;
+        },
+        dragBuilder: (context, child) {
+          if (widget.directDragPreviewBuilder != null) {
+            return widget.directDragPreviewBuilder!(context, index);
+          }
+          return Material(
+            elevation: 8,
+            borderRadius: BorderRadius.circular(10),
+            color: Theme.of(context).colorScheme.surfaceContainerHighest,
+            child: SizedBox(
+              width: rect.width,
+              height: rect.height,
+              child: Opacity(
+                opacity: 0.92,
+                child: widget.itemBuilder(context, index),
+              ),
+            ),
+          );
+        },
+        child: DraggableWidget(
+          hitTestBehavior: HitTestBehavior.translucent,
+          child: innerChild,
+        ),
+      );
+    }
+
     return AnimatedPositioned(
       key: itemKey,
       duration: widget.animationDuration,
@@ -834,7 +1004,7 @@ class _ZoomReorderableSliverGridState
               // 但手柄挂在 Stack 外层，不受影响（拖拽链路要靠它续命）。
               child: IgnorePointer(
                 ignoring: hidden,
-                child: widget.itemBuilder(context, index),
+                child: innerChild,
               ),
             ),
             if (showHandle)
@@ -847,6 +1017,82 @@ class _ZoomReorderableSliverGridState
                 ),
               ),
           ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildNativeDropIndicator(ZoomReorderGeometry geometry) {
+    final insertIndex = _nativeDropInsertIndex;
+    if (insertIndex == null) return const SizedBox.shrink();
+
+    final theme = Theme.of(context);
+    final color = widget.dropIndicatorColor ?? theme.colorScheme.primary;
+    final thickness = widget.dropIndicatorThickness;
+
+    if (!geometry.isGrid) {
+      final double top;
+      if (insertIndex <= 0) {
+        top = 0.0;
+      } else if (insertIndex >= widget.itemCount) {
+        top = geometry.contentHeightFor(widget.itemCount) - thickness;
+      } else {
+        top = insertIndex * geometry.listStride -
+            kFolderListRowSpacing * 0.5 -
+            thickness * 0.5;
+      }
+
+      return Positioned(
+        key: const ValueKey<String>('zoom-native-drop-indicator'),
+        left: 0,
+        right: 0,
+        top: top,
+        height: thickness,
+        child: IgnorePointer(
+          child: Container(
+            margin: const EdgeInsets.symmetric(horizontal: 4.0),
+            decoration: BoxDecoration(
+              color: color,
+              borderRadius: BorderRadius.circular(999),
+              boxShadow: [
+                BoxShadow(
+                  color: color.withValues(alpha: 0.55),
+                  blurRadius: 8,
+                  spreadRadius: 1,
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+
+    final clampedSlot = insertIndex.clamp(0, widget.itemCount);
+    final rect = geometry.rectForSlot(clampedSlot);
+    final isEndOfRow = geometry.columns > 1 && clampedSlot == widget.itemCount;
+    final left = isEndOfRow
+        ? rect.left + rect.width + (kGridCrossAxisSpacing * 0.5) - (thickness * 0.5)
+        : rect.left - (kGridCrossAxisSpacing * 0.5) - (thickness * 0.5);
+
+    return Positioned(
+      key: const ValueKey<String>('zoom-native-drop-indicator'),
+      left: math.max(0.0, left),
+      top: rect.top,
+      width: thickness,
+      height: rect.height,
+      child: IgnorePointer(
+        child: Container(
+          decoration: BoxDecoration(
+            color: color,
+            borderRadius: BorderRadius.circular(999),
+            boxShadow: [
+              BoxShadow(
+                color: color.withValues(alpha: 0.55),
+                blurRadius: 8,
+                spreadRadius: 1,
+              ),
+            ],
+          ),
         ),
       ),
     );
