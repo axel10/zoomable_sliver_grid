@@ -176,16 +176,27 @@ class _ReorderDemoPageState extends State<ReorderDemoPage> {
                                     : 1)
                                 : 1,
                             onReorder: _handleReorder,
-                            itemDragItemBuilder: (index, localData) {
-                              final item = _items[index];
+                            itemDragItemBuilder: (index, selectedIndices, localData) {
+                              final List<String> titles;
+                              if (selectedIndices.length > 1) {
+                                titles = selectedIndices
+                                    .where((i) => i >= 0 && i < _items.length)
+                                    .map((i) => 'Track ${_items[i].id + 1}')
+                                    .toList();
+                              } else {
+                                final item = _items[index];
+                                titles = ['Track ${item.id + 1}'];
+                              }
+
                               final dragItem = DragItem(
                                 localData: {
                                   ...localData,
-                                  'title': 'Track ${item.id + 1}',
+                                  'title': titles.first,
+                                  'titles': titles,
                                 },
                               );
                               dragItem.add(
-                                Formats.plainText('Track ${item.id + 1} - Acoustic Echo'),
+                                Formats.plainText(titles.join('\n')),
                               );
                               return dragItem;
                             },
@@ -267,19 +278,28 @@ class _ReorderDemoPageState extends State<ReorderDemoPage> {
               onPerformDrop: (event) async {
                 setState(() => _isQueueHovered = false);
                 final item = event.session.items.firstOrNull;
-                String addedTitle = '未知条目';
+                final List<String> addedTitles = [];
                 if (item?.localData is Map) {
                   final map = item!.localData as Map;
-                  if (map['title'] != null) {
-                    addedTitle = map['title'].toString();
+                  if (map['titles'] is List) {
+                    addedTitles.addAll((map['titles'] as List).cast<String>());
+                  } else if (map['title'] != null) {
+                    addedTitles.add(map['title'].toString());
                   }
                 }
+                if (addedTitles.isEmpty) {
+                  addedTitles.add('未知条目');
+                }
                 setState(() {
-                  _mockQueue.add(addedTitle);
+                  _mockQueue.addAll(addedTitles);
                 });
                 ScaffoldMessenger.of(context).showSnackBar(
                   SnackBar(
-                    content: Text('已将 $addedTitle 加入播放队列！'),
+                    content: Text(
+                      addedTitles.length > 1
+                          ? '已将 ${addedTitles.length} 个条目批量加入播放队列！'
+                          : '已将 ${addedTitles.first} 加入播放队列！',
+                    ),
                     duration: const Duration(seconds: 1),
                   ),
                 );

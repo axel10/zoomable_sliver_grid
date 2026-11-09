@@ -24,9 +24,11 @@ typedef ZoomReorderPreviewBuilder = Widget Function(
 );
 
 /// 为直接拖拽的条目生成系统级 [DragItem]（例如携带外部应用或队列抽屉能识别的数据）。
-/// [localData] 已预先注入了本网格的签名字段（`_zoom_grid_id` 和 `_zoom_index`）。
+/// [selectedIndices] 为当前被一并拖拽的索引集合（若多选且当前项在已选列表中，则包含整组；否则仅包含当前项）。
+/// [localData] 已预先注入了本网格的签名字段（`_zoom_grid_id`、`_zoom_index`、`_zoom_indices`）。
 typedef ZoomItemDragItemBuilder = FutureOr<DragItem> Function(
   int index,
+  Set<int> selectedIndices,
   Map<String, dynamic> localData,
 );
 
@@ -672,8 +674,9 @@ class ZoomReorderableSliverGrid extends StatefulWidget {
   /// 自定义条目直接拖拽时发布的系统级 [DragItem]（可携带文件路径或 URI 等，用于拖出到外部接收区）。
   final ZoomItemDragItemBuilder? itemDragItemBuilder;
 
-  /// 条目直接拖拽时的浮动预览构建器。如果不传，默认展示带圆角阴影的条目本身快照。
-  final Widget Function(BuildContext context, int index)? directDragPreviewBuilder;
+  /// 条目直接拖拽时的浮动预览构建器。如果不传，单选默认展示条目快照，多选默认展示合集数量卡片。
+  final Widget Function(BuildContext context, int index, Set<int> selectedIndices)?
+      directDragPreviewBuilder;
 
   /// 高亮插入指示线颜色。
   final Color? dropIndicatorColor;
@@ -849,9 +852,16 @@ class _ZoomReorderableSliverGridState
     final localData = firstItem?.localData;
 
     if (localData is Map && localData['_zoom_grid_id'] == _gridId) {
-      final draggedIndex = localData['_zoom_index'];
-      if (draggedIndex is int) {
-        widget.onReorder({draggedIndex}, targetIndex);
+      final draggedIndicesRaw = localData['_zoom_indices'];
+      final Set<int> draggedIndices;
+      if (draggedIndicesRaw is List) {
+        draggedIndices = draggedIndicesRaw.cast<int>().toSet();
+      } else {
+        final draggedIndex = localData['_zoom_index'];
+        draggedIndices = draggedIndex is int ? {draggedIndex} : <int>{};
+      }
+      if (draggedIndices.isNotEmpty) {
+        widget.onReorder(draggedIndices, targetIndex);
         return;
       }
     }
@@ -867,8 +877,6 @@ class _ZoomReorderableSliverGridState
     final showDirectDrag = widget.enabled &&
         widget.enableDirectDrag &&
         ZoomReorderableSliverGrid.isNativeDragSupported &&
-        !widget.showHandles &&
-        widget.selectedIndices.isEmpty &&
         !_controller.isDragging;
 
     final content = AnimatedBuilder(
@@ -942,28 +950,51 @@ class _ZoomReorderableSliverGridState
     Widget innerChild = widget.itemBuilder(context, index);
 
     if (showDirectDrag && !widget.lockedIndices.contains(index)) {
+      final isPartSelected = widget.selectedIndices.contains(index);
+      final pickedIndices = isPartSelected && widget.selectedIndices.length > 1
+          ? widget.selectedIndices
+              .where((i) => !widget.lockedIndices.contains(i))
+              .toSet()
+          : <int>{index};
+
       innerChild = DragItemWidget(
         allowedOperations: () => const [DropOperation.move, DropOperation.copy],
         dragItemProvider: (request) async {
           final local = <String, dynamic>{
             '_zoom_grid_id': _gridId,
             '_zoom_index': index,
+            '_zoom_indices': pickedIndices.toList(),
           };
           DragItem? item;
           if (widget.itemDragItemBuilder != null) {
-            item = await widget.itemDragItemBuilder!(index, local);
+            item = await widget.itemDragItemBuilder!(
+              index,
+              pickedIndices,
+              local,
+            );
           }
           item ??= DragItem(localData: local);
           if (item.localData is Map) {
             final map = item.localData as Map;
             map['_zoom_grid_id'] = _gridId;
             map['_zoom_index'] = index;
+            map['_zoom_indices'] = pickedIndices.toList();
           }
           return item;
         },
         dragBuilder: (context, child) {
           if (widget.directDragPreviewBuilder != null) {
-            return widget.directDragPreviewBuilder!(context, index);
+            return widget.directDragPreviewBuilder!(
+              context,
+              index,
+              pickedIndices,
+            );
+          }
+          if (pickedIndices.length > 1) {
+            return ZoomReorderPreview(
+              count: pickedIndices.length,
+              size: rect.size,
+            );
           }
           return Material(
             elevation: 8,
