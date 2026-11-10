@@ -16,6 +16,19 @@ typedef ZoomReorderCallback = void Function(
   int insertIndex,
 );
 
+/// 异步重排回调：当持久化操作需要网络请求或异步写入时使用。
+/// 返回 `false` 或抛出异常代表失败，组件将触发 `onReorderError`；返回 `true` 或 `null` 代表成功。
+typedef ZoomReorderAsyncCallback = FutureOr<bool?> Function(
+  Set<int> draggedIndices,
+  int insertIndex,
+);
+
+/// 异步重排失败或抛出异常时的错误回调。
+typedef ZoomReorderErrorCallback = void Function(
+  Object error,
+  StackTrace stackTrace,
+);
+
 /// 自定义合集浮层外观；不传则用包内自带的 [ZoomReorderPreview]。
 typedef ZoomReorderPreviewBuilder = Widget Function(
   BuildContext context,
@@ -173,6 +186,12 @@ class ZoomReorderController extends ChangeNotifier {
   int itemCount = 0;
   Set<int> selectedIndices = const <int>{};
   ZoomReorderCallback? onReorder;
+  ZoomReorderAsyncCallback? onReorderAsync;
+  ZoomReorderErrorCallback? onReorderError;
+
+  /// 异步重排进行中的状态。当此值为 true 时，正在等待异步回调完成，
+  /// 此时起拖会被拦截，避免并发冲突。
+  final ValueNotifier<bool> isAsyncReordering = ValueNotifier<bool>(false);
 
   /// 合集在网格里占几个槽。列表态按需求压缩成 1 行，网格态默认也是 1 格。
   int placeholderCount;
@@ -223,7 +242,7 @@ class ZoomReorderController extends ChangeNotifier {
   }
 
   void startDrag(int index, Offset globalPosition, {bool forceSingle = false}) {
-    if (isDragging || index < 0 || index >= itemCount) return;
+    if (isDragging || isAsyncReordering.value || index < 0 || index >= itemCount) return;
     if (lockedIndices.contains(index)) return;
     final selection = selectedIndices;
     final Set<int> picked;
@@ -289,7 +308,34 @@ class ZoomReorderController extends ChangeNotifier {
     final picked = Set<int>.from(dragging.value);
     final at = insertIndex;
     _finishDrag();
-    if (commit) onReorder?.call(picked, at);
+    if (!commit) return;
+    if (onReorderAsync != null) {
+      dispatchAsyncReorder(picked, at);
+    } else {
+      onReorder?.call(picked, at);
+    }
+  }
+
+  /// 派发异步重排，管理 [isAsyncReordering] 状态与异常捕获。
+  Future<void> dispatchAsyncReorder(Set<int> picked, int at) async {
+    final callback = onReorderAsync;
+    if (callback == null) return;
+    isAsyncReordering.value = true;
+    notifyListeners();
+    try {
+      final result = await callback(picked, at);
+      if (result == false) {
+        onReorderError?.call(
+          StateError('Async reorder returned false'),
+          StackTrace.current,
+        );
+      }
+    } catch (e, st) {
+      onReorderError?.call(e, st);
+    } finally {
+      isAsyncReordering.value = false;
+      notifyListeners();
+    }
   }
 
   void cancelDrag() => endDrag(commit: false);
@@ -358,6 +404,7 @@ class ZoomReorderController extends ChangeNotifier {
     pointer.dispose();
     dragging.dispose();
     reorderActive.dispose();
+    isAsyncReordering.dispose();
     super.dispose();
   }
 }
@@ -610,7 +657,10 @@ class ZoomReorderableSliverGrid extends StatefulWidget {
     required this.width,
     required this.itemCount,
     required this.itemBuilder,
-    required this.onReorder,
+    this.onReorder,
+    this.onReorderAsync,
+    this.onReorderError,
+    this.asyncIndicatorBuilder,
     this.itemKeyBuilder,
     this.section,
     this.selectedIndices = const <int>{},
@@ -629,13 +679,20 @@ class ZoomReorderableSliverGrid extends StatefulWidget {
     this.dropIndicatorColor,
     this.dropIndicatorThickness = 3.0,
     this.onExternalDrop,
-  });
+  }) : assert(
+          onReorder != null || onReorderAsync != null,
+          'Either onReorder or onReorderAsync must be provided.',
+        );
 
   final FolderZoomLayoutMetrics metrics;
   final double width;
   final int itemCount;
   final Widget Function(BuildContext context, int index) itemBuilder;
-  final ZoomReorderCallback onReorder;
+  final ZoomReorderCallback? onReorder;
+  final ZoomReorderAsyncCallback? onReorderAsync;
+  final ZoomReorderErrorCallback? onReorderError;
+  final Widget Function(BuildContext context, bool isReordering)?
+      asyncIndicatorBuilder;
 
   /// 为每个条目提供稳定的 [Key]。
   ///
@@ -804,6 +861,8 @@ class _ZoomReorderableSliverGridState
     _controller.minInsertIndex = widget.minInsertIndex;
     _controller.placeholderCount = widget.placeholderCount;
     _controller.onReorder = widget.enabled ? widget.onReorder : null;
+    _controller.onReorderAsync = widget.enabled ? widget.onReorderAsync : null;
+    _controller.onReorderError = widget.onReorderError;
     _controller.resolveBox = () {
       final boxContext = _boxKey.currentContext;
       if (boxContext == null) return null;
@@ -819,6 +878,9 @@ class _ZoomReorderableSliverGridState
     DropOverEvent event,
     ZoomReorderGeometry geometry,
   ) {
+    if (_controller.isAsyncReordering.value || !widget.enabled) {
+      return DropOperation.none;
+    }
     final local = event.position.local;
     final insertIndex = geometry.insertIndexFor(local, widget.itemCount);
 
@@ -849,6 +911,7 @@ class _ZoomReorderableSliverGridState
     final targetIndex = _nativeDropInsertIndex;
     _clearNativeDrop();
     if (targetIndex == null) return;
+    if (_controller.isAsyncReordering.value || !widget.enabled) return;
 
     final firstItem = event.session.items.firstOrNull;
     final localData = firstItem?.localData;
@@ -863,7 +926,11 @@ class _ZoomReorderableSliverGridState
         draggedIndices = draggedIndex is int ? {draggedIndex} : <int>{};
       }
       if (draggedIndices.isNotEmpty) {
-        widget.onReorder(draggedIndices, targetIndex);
+        if (widget.onReorderAsync != null) {
+          _controller.dispatchAsyncReorder(draggedIndices, targetIndex);
+        } else {
+          widget.onReorder?.call(draggedIndices, targetIndex);
+        }
         return;
       }
     }
@@ -886,6 +953,7 @@ class _ZoomReorderableSliverGridState
       builder: (context, _) {
         final slotCount = _controller.slotCount;
         final height = math.max(1.0, geometry.contentHeightFor(slotCount));
+        final isAsyncReordering = _controller.isAsyncReordering.value;
         return SizedBox(
           key: _boxKey,
           width: widget.width,
@@ -898,6 +966,24 @@ class _ZoomReorderableSliverGridState
               if (_controller.isDragging) _buildPlaceholder(geometry),
               if (_nativeDropInsertIndex != null)
                 _buildNativeDropIndicator(geometry),
+              if (widget.asyncIndicatorBuilder != null)
+                widget.asyncIndicatorBuilder!(context, isAsyncReordering)
+              else if (isAsyncReordering)
+                Positioned(
+                  top: 0,
+                  left: 0,
+                  right: 0,
+                  child: SizedBox(
+                    height: 2.5,
+                    child: LinearProgressIndicator(
+                      backgroundColor: Colors.transparent,
+                      valueColor: AlwaysStoppedAnimation<Color>(
+                        widget.dropIndicatorColor ??
+                            Theme.of(context).colorScheme.primary,
+                      ),
+                    ),
+                  ),
+                ),
             ],
           ),
         );
@@ -962,6 +1048,9 @@ class _ZoomReorderableSliverGridState
       innerChild = DragItemWidget(
         allowedOperations: () => const [DropOperation.move, DropOperation.copy],
         dragItemProvider: (request) async {
+          if (_controller.isAsyncReordering.value || !widget.enabled) {
+            return null;
+          }
           final local = <String, dynamic>{
             '_zoom_grid_id': _gridId,
             '_zoom_index': index,
@@ -1047,6 +1136,8 @@ class _ZoomReorderableSliverGridState
                 right: 4.0,
                 child: ZoomReorderHandle(
                   index: index,
+                  enabled:
+                      widget.enabled && !_controller.isAsyncReordering.value,
                   child: widget.handleChild,
                 ),
               ),

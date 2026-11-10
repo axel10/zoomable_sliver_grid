@@ -69,6 +69,12 @@ class _ReorderDemoPageState extends State<ReorderDemoPage> {
   // 网格态合集是只避让 1 个格子，还是按被拖条数避让 N 个格子，交给实测对比。
   bool _useFullPlaceholder = false;
 
+  // 异步重排演示配置
+  bool _enableAsyncMode = true;
+  int _mockNetworkDelayMs = 800;
+  bool _simulateNetworkError = false;
+  List<_ReorderDemoItem>? _previousItemsSnapshot;
+
   Set<int> get _selectedIndices {
     if (_selectedIds.isEmpty) return const <int>{};
     return <int>{
@@ -109,6 +115,65 @@ class _ReorderDemoPageState extends State<ReorderDemoPage> {
         insertIndex,
       );
     });
+  }
+
+  Future<bool> _handleReorderAsync(
+    Set<int> draggedIndices,
+    int insertIndex,
+  ) async {
+    // 1. 备份快照供失败回滚
+    _previousItemsSnapshot = List<_ReorderDemoItem>.from(_items);
+
+    // 2. 乐观更新（Optimistic Update）
+    setState(() {
+      _items = ZoomReorderController.applyReorder(
+        _items,
+        draggedIndices,
+        insertIndex,
+      );
+    });
+
+    // 3. 模拟异步网络保存耗时
+    if (_mockNetworkDelayMs > 0) {
+      await Future<void>.delayed(Duration(milliseconds: _mockNetworkDelayMs));
+    }
+
+    // 4. 模拟失败分支
+    if (_simulateNetworkError) {
+      return false;
+    }
+
+    if (mounted) {
+      setState(() {});
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('云端保存成功！'),
+          duration: Duration(milliseconds: 1200),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    }
+    return true;
+  }
+
+  void _handleReorderError(Object error, StackTrace stackTrace) {
+    // 失败回滚至拖拽前的数据快照
+    if (_previousItemsSnapshot != null) {
+      setState(() {
+        _items = _previousItemsSnapshot!;
+        _previousItemsSnapshot = null;
+      });
+    }
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          backgroundColor: Theme.of(context).colorScheme.error,
+          content: const Text('网络请求失败：已回滚至原有顺序！'),
+          duration: const Duration(seconds: 2),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    }
   }
 
   @override
@@ -175,8 +240,14 @@ class _ReorderDemoPageState extends State<ReorderDemoPage> {
                                     ? _selectedIds.length
                                     : 1)
                                 : 1,
-                            onReorder: _handleReorder,
-                            itemDragItemBuilder: (index, selectedIndices, localData) {
+                            onReorder:
+                                _enableAsyncMode ? null : _handleReorder,
+                            onReorderAsync:
+                                _enableAsyncMode ? _handleReorderAsync : null,
+                            onReorderError:
+                                _enableAsyncMode ? _handleReorderError : null,
+                            itemDragItemBuilder:
+                                (index, selectedIndices, localData, [request]) {
                               final List<String> titles;
                               if (selectedIndices.length > 1) {
                                 titles = selectedIndices
@@ -417,7 +488,95 @@ class _ReorderDemoPageState extends State<ReorderDemoPage> {
                   ),
                 ],
               ),
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: <Widget>[
+                  const Text('异步云端同步'),
+                  Switch(
+                    value: _enableAsyncMode,
+                    onChanged: (value) =>
+                        setState(() => _enableAsyncMode = value),
+                  ),
+                ],
+              ),
+              if (_enableAsyncMode) ...[
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: <Widget>[
+                    Text('模拟延迟 ${_mockNetworkDelayMs}ms'),
+                    const SizedBox(width: 4),
+                    DropdownButton<int>(
+                      value: _mockNetworkDelayMs,
+                      isDense: true,
+                      items: const [
+                        DropdownMenuItem(value: 300, child: Text('300ms')),
+                        DropdownMenuItem(value: 800, child: Text('800ms')),
+                        DropdownMenuItem(value: 1500, child: Text('1.5s')),
+                      ],
+                      onChanged: (v) {
+                        if (v != null) setState(() => _mockNetworkDelayMs = v);
+                      },
+                    ),
+                  ],
+                ),
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: <Widget>[
+                    Text(
+                      '模拟失败回滚',
+                      style: TextStyle(
+                        color: _simulateNetworkError
+                            ? theme.colorScheme.error
+                            : null,
+                      ),
+                    ),
+                    Switch(
+                      value: _simulateNetworkError,
+                      activeTrackColor: theme.colorScheme.error,
+                      onChanged: (value) =>
+                          setState(() => _simulateNetworkError = value),
+                    ),
+                  ],
+                ),
+              ],
             ],
+          ),
+          const SizedBox(height: 6),
+          ValueListenableBuilder<bool>(
+            valueListenable: _reorderController.isAsyncReordering,
+            builder: (context, isReordering, _) {
+              if (!isReordering) return const SizedBox.shrink();
+              return Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                margin: const EdgeInsets.only(bottom: 6),
+                decoration: BoxDecoration(
+                  color: theme.colorScheme.primaryContainer,
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    SizedBox(
+                      width: 14,
+                      height: 14,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: theme.colorScheme.onPrimaryContainer,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Text(
+                      '正在同步至云端...（已自动锁定再次拖拽）',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: theme.colorScheme.onPrimaryContainer,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            },
           ),
           const SizedBox(height: 4),
           Text(
