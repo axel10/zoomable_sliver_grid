@@ -282,15 +282,18 @@ FolderGridFontSizes folderGridFontSizes(double cardWidth) {
 const double kFolderListRowSpacing = 0.0;
 
 /// 内容区的左右内边距。
+///
+/// **与档位无关**，恒为 [kGridHorizontalPadding]。曾经按 `gridMorph` 在
+/// 8（竖屏 4）与 16 之间插值，结果切到列表视图时顶部动作行与曲目行一起「变宽」
+/// 十几像素，同一页里页头（写死 16）反而比内容窄。页面传给 `SliverPadding`
+/// 的值也会被 [FolderZoomGeometry] 按档位重新校正，所以只能在源头统一。
+///
+/// [isPortrait] / [gridMorph] 保留只为不改调用点，已不参与计算。
 double folderContentHorizontalPadding({
   required bool isPortrait,
   required double gridMorph,
 }) {
-  return lerpDouble(
-    isPortrait ? 4.0 : 8.0,
-    kGridHorizontalPadding,
-    gridMorph.clamp(0.0, 1.0),
-  )!;
+  return kGridHorizontalPadding;
 }
 
 /// 缩放的布局规格：列数、卡片几何、滚动偏移估算。
