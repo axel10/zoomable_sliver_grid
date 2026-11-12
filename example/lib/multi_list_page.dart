@@ -1,13 +1,16 @@
 import 'package:flutter/material.dart';
 import 'package:zoomable_sliver_grid/zoomable_sliver_grid.dart';
 
-/// 一个页面里放**两个**参与缩放的网格：
-/// 目录列表 → 一行固定高的介绍 → 文件列表。
+/// 一个页面里放**多段**参与缩放的网格（默认 4 段）：
+/// 目录 → 收藏 → 一行固定高的介绍 → 文件列表 → 最近播放。
 ///
-/// 两个网格共用同一个 [FolderZoomSliverBuilder]（列数 / 字号只取决于宽度和档位，
+/// 所有网格共用同一个 [FolderZoomSliverBuilder]（列数 / 字号只取决于宽度和档位，
 /// 天然一致），各自通过 `SliverAnimatedZoomGridDelegate.section` 声明身份。
-/// 换档时滚动补偿按页面坐标统一结算：下游网格会随上游网格的高度变化整体平移，
-/// 所以两个列表是一起动、一起停的，不会出现"上面动完下面才跳一下"。
+/// 换档时滚动补偿按页面坐标统一结算：任意一段变高变矮，它下游的所有段都会一起
+/// 平移，所以整页是一起动、一起停的，不会出现"上面动完下面才跳一下"。
+///
+/// 段数不限于两段 —— 段之间夹的固定高内容（段标题、介绍卡）多几层也没关系，
+/// 那些高度会从 `precede` 里扣掉，只留下"不随档位变化"的部分。
 class MultiListPage extends StatefulWidget {
   const MultiListPage({super.key});
 
@@ -17,7 +20,9 @@ class MultiListPage extends StatefulWidget {
 
 class _MultiListPageState extends State<MultiListPage> {
   static const Object _folderSection = 'folders';
+  static const Object _favoriteSection = 'favorites';
   static const Object _fileSection = 'files';
+  static const Object _recentSection = 'recent';
 
   double _zoomScale = kFolderZoomTierStandardList;
 
@@ -31,6 +36,16 @@ class _MultiListPageState extends State<MultiListPage> {
     );
   });
 
+  final List<_DemoItem> _favorites = List.generate(18, (i) {
+    return _DemoItem(
+      title: '收藏 ${i + 1}',
+      subtitle: 'Artist ${i % 6 + 1}',
+      info: '${2 + i % 4}:${((i * 11) % 60).toString().padLeft(2, '0')}',
+      color: const Color(0xFFEC407A),
+      icon: Icons.favorite_rounded,
+    );
+  });
+
   final List<_DemoItem> _files = List.generate(96, (i) {
     return _DemoItem(
       title: '录音 ${i + 1}.flac',
@@ -40,6 +55,42 @@ class _MultiListPageState extends State<MultiListPage> {
       icon: Icons.audiotrack_rounded,
     );
   });
+
+  final List<_DemoItem> _recent = List.generate(24, (i) {
+    return _DemoItem(
+      title: '最近播放 ${i + 1}',
+      subtitle: '昨天 ${8 + i % 12}:00',
+      info: '${1 + i % 6}:${((i * 13) % 60).toString().padLeft(2, '0')}',
+      color: const Color(0xFF42A5F5),
+      icon: Icons.history_rounded,
+    );
+  });
+
+  /// 段标题：固定高度、不参与缩放，夹在各段之间。
+  Widget _sectionHeader(
+    BuildContext context,
+    String title, {
+    required int count,
+  }) {
+    final theme = Theme.of(context);
+    return SliverToBoxAdapter(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+        child: Row(
+          children: [
+            Text(
+              title,
+              style: theme.textTheme.titleSmall?.copyWith(
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            const SizedBox(width: 8),
+            Text('$count', style: theme.textTheme.bodySmall),
+          ],
+        ),
+      ),
+    );
+  }
 
   Widget _section(
     FolderZoomLayoutMetrics metrics, {
@@ -100,7 +151,7 @@ class _MultiListPageState extends State<MultiListPage> {
     final theme = Theme.of(context);
     return Scaffold(
       appBar: AppBar(
-        title: const Text('一页两个列表'),
+        title: const Text('一页多段列表'),
         actions: [
           ZoomButton(
             zoomScale: _zoomScale,
@@ -128,15 +179,23 @@ class _MultiListPageState extends State<MultiListPage> {
                       child: Padding(
                         padding: const EdgeInsets.fromLTRB(16, 16, 16, 4),
                         child: Text(
-                          '下面两段都参与缩放，中间那行介绍高度固定',
+                          '这一页有 4 段网格（目录 / 收藏 / 录音文件 / 最近播放）都参与缩放，'
+                          '中间的段标题和介绍卡高度固定；换档时它们之间的相对位置不该变',
                           style: theme.textTheme.bodySmall,
                         ),
                       ),
                     ),
+                    _sectionHeader(context, '目录', count: _folders.length),
                     _section(
                       metrics,
                       section: _folderSection,
                       items: _folders,
+                    ),
+                    _sectionHeader(context, '收藏', count: _favorites.length),
+                    _section(
+                      metrics,
+                      section: _favoriteSection,
+                      items: _favorites,
                     ),
                     // 固定高的一行介绍：不属于任何一段，因此也不随档位变形。
                     SliverToBoxAdapter(
@@ -170,7 +229,7 @@ class _MultiListPageState extends State<MultiListPage> {
                                     ),
                                     const SizedBox(height: 4),
                                     Text(
-                                      '这行的高度是固定的，换档时上下两个列表'
+                                      '这块高度是固定的，换档时上下四段'
                                       '必须一起被补偿',
                                       style: theme.textTheme.bodySmall,
                                     ),
@@ -182,10 +241,17 @@ class _MultiListPageState extends State<MultiListPage> {
                         ),
                       ),
                     ),
+                    _sectionHeader(context, '录音文件', count: _files.length),
                     _section(
                       metrics,
                       section: _fileSection,
                       items: _files,
+                    ),
+                    _sectionHeader(context, '最近播放', count: _recent.length),
+                    _section(
+                      metrics,
+                      section: _recentSection,
+                      items: _recent,
                     ),
                     const SliverToBoxAdapter(child: SizedBox(height: 32)),
                   ],

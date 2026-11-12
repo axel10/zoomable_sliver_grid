@@ -120,7 +120,7 @@ class _DemoHomePageState extends State<DemoHomePage> {
           ),
           IconButton(
             icon: const Icon(Icons.view_agenda_rounded),
-            tooltip: '一页两个列表',
+            tooltip: '一页多段列表',
             onPressed: () {
               Navigator.of(context).push(
                 MaterialPageRoute<void>(

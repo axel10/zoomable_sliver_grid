@@ -659,6 +659,15 @@ class FolderZoomViewportTracker {
   /// 过渡期是否处于"多几何层混合"状态；用于只在过渡结束那一帧打一次日志。
   bool _wasMixing = false;
 
+  /// 过渡结束那一帧的帧号，以及当时冻结的焦点高度。
+  ///
+  /// 同一个滚动像素在两个档位下算出来的焦点高度不同（渐变区的取值依赖
+  /// `pageTop`，而 `pageTop` 随档位变），所以"解换档目标"和"settle 后反取锚点"
+  /// 必须用同一个 `f`，否则往返一次就净丢 `|f_new - f_old|` 那么长的一段内容，
+  /// 反复换档就会持续漂移。冻结只在 settle 那一帧有效，下一帧恢复正常重算。
+  int _frozenFocusFrame = -1;
+  double? _frozenFocusY;
+
   /// 上一次布局时 `pixels - scrollOffset` 的值；恒定才算对齐，变化就说明挑错了位置。
   double? _lastPrecede;
 
@@ -978,15 +987,34 @@ class FolderZoomViewportTracker {
 
     if (!isAnimating && layers.length == 1) {
       steadyLayer = layers.first;
-      _recomputeAnchor(focusFraction, isPortrait);
-      _refreshTailExtent(layers);
-      correction = 0.0;
+      // 过渡刚结束：把过渡期间冻结的焦点高度抄下来，**本帧内**都拿它反取锚点。
+      //
+      // 不能只用一个"刚 settle"的布尔量：一帧里每个参与布局的 sliver 都会各调
+      // 一次 `record`，第一次就把标志清掉，后面几次会用新算的焦点把刚复用的值
+      // 覆盖回去，等于没改。所以按帧号冻结（见 `_recomputeAnchor`）。
       if (_wasMixing) {
         _wasMixing = false;
+        _frozenFocusFrame = _frameIndex;
+        final _ZoomSectionState? anchored = _sections[_anchorSectionId];
+        _frozenFocusY = (anchored != null &&
+                anchored.hasAnchor &&
+                _anchorEdge == _ZoomAnchorEdge.none)
+            ? anchored.anchorFocusY
+            : null;
+      }
+      _recomputeAnchor(
+        focusFraction,
+        isPortrait,
+        frozenFocus: _frozenFocusFrame == _frameIndex ? _frozenFocusY : null,
+      );
+      _refreshTailExtent(layers);
+      correction = 0.0;
+      if (_frozenFocusFrame == _frameIndex) {
         zoomLog('layout', () {
           return 'settle top=${zd(viewportTop)} px=${zd(layoutPixels)} '
               'anchor=${_anchorEdge.name}#$anchorIndex r=${zd(anchorRatio, 3)} '
-              'f=${zd(anchorFocusY)} layer=${_layerTag(layers.first)} '
+              'f=${zd(anchorFocusY)} frozen=${zd(_frozenFocusY)} '
+              'layer=${_layerTag(layers.first)} '
               'tail=${zd(tailExtent)} '
               'sections=${_ordered.length} '
               'pageMax=${zd(maxPagePixelsFor(layers.first))}';
@@ -1081,7 +1109,11 @@ class FolderZoomViewportTracker {
     }
   }
 
-  void _recomputeAnchor(double focusFraction, bool isPortrait) {
+  void _recomputeAnchor(
+    double focusFraction,
+    bool isPortrait, {
+    double? frozenFocus,
+  }) {
     final layer = steadyLayer;
     final height = viewportHeight;
     if (layer == null || _ordered.isEmpty || height <= 1.0) return;
@@ -1139,6 +1171,17 @@ class FolderZoomViewportTracker {
       }
     }
 
+    // 沿用冻结焦点只对"焦点锚"成立：贴顶 / 贴底是精确对齐，重新判一次才是对的。
+    // 必须在 [_setAnchorSection] 之前取，它会把各段的 `hasAnchor` 重置成只有新锚段为真。
+    final _ZoomSectionState? previous = _sections[_anchorSectionId];
+    final double? reuseFocus = frozenFocus != null &&
+            _anchorEdge == _ZoomAnchorEdge.none &&
+            previous != null &&
+            previous.hasAnchor &&
+            identical(previous, anchor)
+        ? frozenFocus
+        : null;
+
     _setAnchorSection(_ZoomAnchorEdge.none, anchor);
 
     // 本段视口顶端在段局部坐标里的位置。**不用** `anchor.viewportTop`：那是上一次
@@ -1158,6 +1201,23 @@ class FolderZoomViewportTracker {
     // 内容**：把焦点压到第一条上，解出来的目标就等于"把起始边钉在原地"，
     // 不会把页面莫名往下滚一屏。
     focus = math.max(focus, -sectionTop);
+
+    // 过渡刚结束那一帧：沿用过渡开始时冻结的焦点高度，而不是按新位置重算的焦点。
+    //
+    // 换档目标是用**冻结**的 `anchorFocusY` 解出来的：
+    // `px_target = pageStart + geom.offset + r * stride - f_old`，
+    // 也就是说"内容点 = px - pageStart + f_old"。而 settle 那一刻如果改用新算的
+    // `f_new` 去反取内容点，同一个像素就被解释成另一个内容点，偏差
+    // `f_new - f_old` —— 一次往返就把这段内容永久丢掉，再换一次继续丢，于是
+    // 页面在"距顶 / 距底不足一屏"的区间里反复换档会持续漂移。
+    //
+    // `f` 在渐变区的取值依赖 `pageTop`，而 `pageTop` 本身随档位变，所以两档的
+    // `f` 通常不等（实测 400.0 与 375.9）。只要**解目标**和**反取内容点**用同一个
+    // `f`，两档之间的换算就是可逆的；下一帧的稳态重算无害 —— 那次换档的目标也会
+    // 用同一帧记录的 `f`。
+    if (reuseFocus != null) {
+      focus = reuseFocus;
+    }
     final double contentPoint = sectionTop + focus;
 
     int index = _minIndexFor(anchor, layer, contentPoint);
