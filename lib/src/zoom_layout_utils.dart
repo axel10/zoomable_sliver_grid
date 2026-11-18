@@ -3013,6 +3013,10 @@ class _FolderZoomSliverBuilderState extends State<FolderZoomSliverBuilder>
         ..start();
       _lastWrittenPixels = null;
     } else {
+      if (_controller.isAnimating) {
+        _controller.stop();
+      }
+      _handoffFlipMorph = null;
       _fromZoomScale = _toZoomScale = widget.zoomScale;
       _fromGridMorph = _toGridMorph = targets.gridMorph;
       _fromCompactMorph = _toCompactMorph = targets.compactMorph;
@@ -3053,23 +3057,42 @@ class _FolderZoomSliverBuilderState extends State<FolderZoomSliverBuilder>
       _activePinchController = pinch;
       _activePinchController?.addListener(_onPinchChanged);
     }
-    if (_initialized) return;
-    _applyTargets(_targets(), animate: false);
-    _initialized = true;
-    if (!_loggedEnv && folderZoomDebugLog) {
-      _loggedEnv = true;
-      zoomLog('env', () {
-        return 'platform=$defaultTargetPlatform '
-            'size=${MediaQuery.maybeSizeOf(context)} '
-            'dpr=${MediaQuery.maybeDevicePixelRatioOf(context)} '
-            'textScale=${zd(folderZoomTextScaleOf(context), 2)} '
-            'portrait=${MediaQuery.maybeOrientationOf(context) == Orientation.portrait} '
-            'zoom=${zd(widget.zoomScale, 3)} w=${zd(widget.width)}';
+    final bool tickerEnabled = TickerMode.valuesOf(context).enabled;
+    if (!_initialized) {
+      _tickerEnabled = tickerEnabled;
+      _applyTargets(_targets(), animate: false);
+      _initialized = true;
+      if (!_loggedEnv && folderZoomDebugLog) {
+        _loggedEnv = true;
+        zoomLog('env', () {
+          return 'platform=$defaultTargetPlatform '
+              'size=${MediaQuery.maybeSizeOf(context)} '
+              'dpr=${MediaQuery.maybeDevicePixelRatioOf(context)} '
+              'textScale=${zd(folderZoomTextScaleOf(context), 2)} '
+              'portrait=${MediaQuery.maybeOrientationOf(context) == Orientation.portrait} '
+              'zoom=${zd(widget.zoomScale, 3)} w=${zd(widget.width)}';
+        });
+      }
+      return;
+    }
+    if (!tickerEnabled) {
+      _tickerEnabled = false;
+      _justResumedFromMuted = false;
+    } else if (!_tickerEnabled) {
+      _tickerEnabled = true;
+      // 路由被压在后台（TickerMode=false）期间若发生切档，包在 LayoutBuilder 里时
+      // 要等返回动画第一帧才触发 didUpdateWidget；标记本帧直接无动画落位，避免
+      // 在后台/返回首帧从旧视图模式起播动画（Windows 转场快照也会定格该旧帧）。
+      _justResumedFromMuted = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _justResumedFromMuted = false;
       });
     }
   }
 
   bool _loggedEnv = false;
+  bool _tickerEnabled = true;
+  bool _justResumedFromMuted = false;
 
   @override
   void didUpdateWidget(FolderZoomSliverBuilder oldWidget) {
@@ -3087,18 +3110,18 @@ class _FolderZoomSliverBuilderState extends State<FolderZoomSliverBuilder>
       final bool pinchHandoff = pinch != null &&
           pinch.committedScale != null &&
           (pinch.committedScale! - widget.zoomScale).abs() < 1e-4;
+      final bool skipAnimation =
+          pinchHandoff || !_tickerEnabled || _justResumedFromMuted;
+      _justResumedFromMuted = false;
       zoomLog('didUpdate', () {
         return 'scale ${zd(oldWidget.zoomScale, 3)} -> ${zd(widget.zoomScale, 3)} '
             'pinch=${pinch != null} committed=${zd(pinch?.committedScale, 3)} '
-            'animate=${!pinchHandoff} '
+            'animate=${!skipAnimation} '
+            'muted=${!_tickerEnabled} '
             'pos=${zd(_currentScrollPixels())} '
             'top=${zd(_viewportTracker.viewportTop)}';
       });
-      if (pinchHandoff) {
-        _applyTargets(targets, animate: false);
-      } else {
-        _applyTargets(targets, animate: true);
-      }
+      _applyTargets(targets, animate: !skipAnimation);
     } else if (widthChanged) {
       _fromGridCols = _toGridCols = targets.gridCols;
       _fromGridTextHeight = _toGridTextHeight = targets.gridTextHeight;
